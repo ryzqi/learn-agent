@@ -210,6 +210,15 @@ async function execute(profile: ChapterProfile, prompt: string): Promise<number>
       ...(protocolRuntime === undefined ? {} : { protocolRuntime }),
       ...(mcpRuntime === undefined ? {} : { mcpRuntime }),
     });
+    if (teammateRuntime !== undefined) {
+      // 队友结果到达 Lead mailbox 后，立即请求独立 event turn。
+      teammateRuntime.bindWakeup(async () => {
+        if (runner === undefined) {
+          throw new Error("Teammate wakeup received before AgentRunner was built");
+        }
+        await runner.runEvents();
+      });
+    }
     if (cronRuntime !== undefined) {
       cronRuntime.bindWakeup(async () => {
         if (runner === undefined) {

@@ -163,6 +163,15 @@ async function execute(profile: ChapterProfile, prompt: string): Promise<number>
     // 在创建任何运行状态前先验证 cwd 是 Git repository root，避免在错误目录留下任务库。
     if (worktreeRuntime !== undefined) await worktreeRuntime.validateRepository();
     runner = buildAgent(profile, dependencies);
+    if (teammateRuntime !== undefined) {
+      // 队友结果到达 Lead mailbox 后，立即请求独立 event turn。
+      teammateRuntime.bindWakeup(async () => {
+        if (runner === undefined) {
+          throw new Error("Teammate wakeup received before AgentRunner was built");
+        }
+        await runner.runEvents();
+      });
+    }
     if (cronRuntime !== undefined) {
       // Cron wakeup 在 runner 就绪后绑定，事件回合由同一个 AgentRunner 消费。
       cronRuntime.bindWakeup(async () => {

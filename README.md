@@ -88,6 +88,8 @@ code/
 
 各章不是互相独立的玩具项目：后续快照保留前章行为，并在组合根根据 `P01`–`P20` profile 累加能力。实现细节以当前源码和测试为准；不要把“文件存在”或“能导入”当作章节完成证明。
 
+从第 15 章开始，CLI 同时接入 Teammate 和 Cron 两类 wakeup，并把它们交给同一个 `AgentRunner` 的 `runEvents()` 入口。这样队友消息、定时任务和后台事件都能在明确的 event turn 中进入 Lead 上下文；对应的入口回归测试会防止接线退化。
+
 ## 开始阅读与运行
 
 ### 1. 准备环境
@@ -149,6 +151,8 @@ npm run verify:snapshot-drift
 ```
 
 逐章 review 至少运行对应的 `test:chNN` 和 `typecheck`；共享运行时变化后再运行全量测试、lint、format、build 与快照漂移检查。只有直接验证通过，才能把章节标记为“通过”。
+
+当前代码基线已串行验证通过：`npm test` 为 65 个测试文件、429 个测试；`typecheck`、`lint`、`format:check`、`build` 和 `verify:snapshot-drift` 均通过。真实模型 smoke test 需要用户自行配置 `.env`，不属于离线门禁。
 
 ## 推荐阅读方式
 

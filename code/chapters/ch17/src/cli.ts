@@ -183,6 +183,15 @@ async function execute(profile: ChapterProfile, prompt: string): Promise<number>
       // 显式注入 ProtocolRuntime 后，bootstrap 会校验它与 teammateRuntime 共享 store，避免各持一份状态。
       ...(protocolRuntime === undefined ? {} : { protocolRuntime }),
     });
+    if (teammateRuntime !== undefined) {
+      // 队友结果到达 Lead mailbox 后，立即请求独立 event turn。
+      teammateRuntime.bindWakeup(async () => {
+        if (runner === undefined) {
+          throw new Error("Teammate wakeup received before AgentRunner was built");
+        }
+        await runner.runEvents();
+      });
+    }
     if (cronRuntime !== undefined) {
       cronRuntime.bindWakeup(async () => {
         if (runner === undefined) {
