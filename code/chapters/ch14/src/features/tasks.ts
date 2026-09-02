@@ -6,6 +6,7 @@ import { toolError, toolSuccess } from "../core/tools.js";
 
 const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
+// 任务三态是迁移的唯一来源；blocked 不落盘，而是由依赖图在 claim 时派生。
 export const TaskStatus = Object.freeze({
   PENDING: "pending",
   IN_PROGRESS: "in_progress",
@@ -16,21 +17,33 @@ export const TaskStatus = Object.freeze({
 export type TaskStatus = (typeof TaskStatus)[keyof typeof TaskStatus];
 
 export interface TaskOptions {
+  // 规范 UUID，唯一标识任务。
   readonly id: string;
+  // 任务标题，用于模型规划与列表展示。
   readonly subject: string;
+  // 任务详细说明，可为空字符串。
   readonly description: string;
+  // 当前状态；pending 无 owner，其他状态必须有 owner。
   readonly status: TaskStatus;
+  // 认领者身份；pending 必须为 null。
   readonly owner: string | null;
+  // 依赖任务的规范 UUID；依赖未完成时任务不可 claim。
   readonly blockedBy: readonly string[];
 }
 
 export class Task {
   // Task 构造器集中维护状态、owner 与依赖的领域不变量，存储层不得绕过它。
+  // 规范 UUID，同时是存储文件名和引用 key。
   readonly id: string;
+  // 归一化后的任务标题。
   readonly subject: string;
+  // 归一化后的任务说明。
   readonly description: string;
+  // 当前任务状态。
   readonly status: TaskStatus;
+  // 当前 owner；pending 必须为 null。
   readonly owner: string | null;
+  // 上游依赖 id 列表，冻结后不可修改。
   readonly blockedBy: readonly string[];
 
   constructor(options: TaskOptions) {
@@ -55,10 +68,13 @@ export class Task {
 }
 
 export interface TaskCompletion {
+  // 本次完成的任务。
   readonly task: Task;
+  // 因本次完成而从 blocked 变为 ready 的 pending 任务。
   readonly unblocked: readonly Task[];
 }
 
+// 任务领域错误基类；code 用于工具层返回稳定错误码。
 export class TaskError extends Error {
   readonly code: string;
 
@@ -69,6 +85,7 @@ export class TaskError extends Error {
   }
 }
 
+// 任务不存在。
 export class TaskNotFoundError extends TaskError {
   constructor(message: string) {
     super("task_not_found", message);
@@ -76,6 +93,7 @@ export class TaskNotFoundError extends TaskError {
   }
 }
 
+// 依赖图不满足无环或引用约束。
 export class TaskGraphError extends TaskError {
   constructor(message: string, options?: ErrorOptions) {
     super("task_graph_error", message, options);
@@ -83,6 +101,7 @@ export class TaskGraphError extends TaskError {
   }
 }
 
+// 任务状态不允许当前迁移。
 export class TaskStateError extends TaskError {
   constructor(message: string, code = "task_invalid_state") {
     super(code, message);
@@ -90,6 +109,7 @@ export class TaskStateError extends TaskError {
   }
 }
 
+// 任务仍被未完成任务阻塞，claim 被拒绝。
 export class TaskBlockedError extends TaskStateError {
   readonly taskId: string;
   readonly blockedBy: readonly string[];
@@ -102,6 +122,7 @@ export class TaskBlockedError extends TaskStateError {
   }
 }
 
+// owner 与当前认领者不匹配。
 export class TaskOwnershipError extends TaskError {
   constructor(message: string) {
     super("task_owner_mismatch", message);
@@ -109,6 +130,7 @@ export class TaskOwnershipError extends TaskError {
   }
 }
 
+// 任务存储层读写或 schema 校验失败。
 export class TaskStorageError extends TaskError {
   constructor(message: string, options?: ErrorOptions) {
     super("task_storage_error", message, options);
@@ -117,21 +139,30 @@ export class TaskStorageError extends TaskError {
 }
 
 export interface CreateTaskInput {
+  // 必填任务标题。
   readonly subject: string;
+  // 可选说明；缺省由 store 归一化为空字符串。
   readonly description?: string;
+  // 可选上游依赖；缺省为空。
   readonly blockedBy?: readonly string[];
 }
 
 // TaskStore 是所有持久化实现必须满足的窄接口，工具层不依赖 JSON 或 SQLite 具体实现。
 export interface TaskStore {
   // 任务图操作以完整 Task 返回，调用者不能通过局部补丁跳过状态迁移校验。
+  // 在锁内创建任务，并校验唯一 id、依赖存在性和全图无环。
   createTask(input: CreateTaskInput): Promise<Task>;
+  // 按规范 UUID 读取单个任务。
   getTask(taskId: string): Promise<Task>;
+  // 返回按 id 排序的完整任务图快照。
   listTasks(): Promise<readonly Task[]>;
+  // 仅把 ready pending 任务原子迁移为指定 owner 的 in_progress。
   claimTask(taskId: string, owner: string): Promise<Task>;
+  // 仅由当前 owner 完成 in_progress 任务，并返回直接解除阻塞的 pending 任务。
   completeTask(taskId: string, owner: string): Promise<TaskCompletion>;
 }
 
+// 工具 schema 都使用 .strict()，额外字段会在任何副作用前被拒绝。
 const taskIdSchema = z.string().regex(CANONICAL_UUID, "task_id must be a canonical UUID");
 const createTaskSchema = z
   .object({
@@ -148,15 +179,24 @@ export function registerTaskTools(registry: ToolRegistry, store: TaskStore): voi
   // 五个工具统一由这里注册，schema 与 handler 都来自同一 ToolDefinition。
   registry.register(createTaskDefinition(store));
   registry.register(
-    taskIdDefinition("get_task", "Read one persistent project task by ID.", "read", store),
+    // get_task 是只读查询，不改变状态或 owner。
+    taskIdDefinition(
+      "get_task",
+      "Read one persistent project task by canonical UUID. Read-only; it does not change status or owner.",
+      "read",
+      store,
+    ),
   );
   registry.register({
     name: "list_tasks",
-    description: "List the complete persistent project task graph.",
+    // 返回完整图快照，调用方才能根据依赖和 ready 状态做规划。
+    description:
+      "List the complete persistent project task graph sorted by ID. Use it before create_task to find canonical UUIDs or before claim_task to find ready tasks.",
     inputSchema: listTasksInputSchema,
     effect: "read",
     handler: async (_input, _context) => {
       try {
+        // 返回完整图而不是局部任务，避免模型只看到部分依赖关系。
         const tasks = await store.listTasks();
         return toolSuccess(encodePayload({ tasks: tasks.map(taskPayload) }));
       } catch (error) {
@@ -165,16 +205,19 @@ export function registerTaskTools(registry: ToolRegistry, store: TaskStore): voi
     },
   });
   registry.register(
+    // claim 的 owner 只来自 ToolContext.identity，模型不能选择替谁完成任务。
     taskIdDefinition(
       "claim_task",
-      "Atomically claim a ready pending task as the current identity.",
+      "Atomically claim a ready pending task as the current identity. Owner is set by the runtime identity; do not pass an owner argument.",
       "write",
       store,
     ),
   );
   registry.register({
     name: "complete_task",
-    description: "Complete a claimed task owned by the current identity.",
+    // 完成者只能来自可信 ToolContext.identity。
+    description:
+      "Complete a claimed task owned by the current identity. Returns the completed task and any pending tasks directly unblocked by this completion.",
     inputSchema: taskIdInputSchema,
     effect: "write",
     handler: async (input, context) => {
@@ -199,11 +242,14 @@ export function registerTaskTools(registry: ToolRegistry, store: TaskStore): voi
 function createTaskDefinition(store: TaskStore): ToolDefinition<z.infer<typeof createTaskSchema>> {
   return {
     name: "create_task",
-    description: "Create a persistent project task with explicit dependencies.",
+    // blocked_by 必须引用 list_tasks/get_task 返回的规范 UUID。
+    description:
+      "Create a persistent project task after planning. blocked_by must contain canonical task UUIDs returned by list_tasks or get_task.",
     inputSchema: createTaskSchema,
     effect: "write",
     handler: async (input) => {
       try {
+        // handler 只做输入到 TaskStore 的转发；全图校验与原子写入由持久化边界负责。
         const task = await store.createTask({
           subject: input.subject,
           description: input.description,
@@ -224,6 +270,7 @@ function taskIdDefinition(
   store: TaskStore,
 ): ToolDefinition<z.infer<typeof taskIdInputSchema>> {
   // get/claim 共用 task_id schema，只有 store 调用和 effect 不同。
+  // get/claim 共用 task_id schema；claim 的 owner 只来自 ToolContext.identity，不接受模型参数。
   return {
     name,
     description,

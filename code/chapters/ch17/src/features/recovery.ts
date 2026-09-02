@@ -10,6 +10,9 @@ import type { ModelClient, ModelReply, ModelRequest } from "../core/model.js";
 import { CompactionManager } from "./compaction.js";
 
 // 默认恢复参数集中定义，测试可注入小预算；生产默认把重试和等待控制在一个 turn 内。
+// 文件职责：提供供应商无关的模型恢复层。RecoveryManager 以一次 logical ModelRequest 为边界，
+// 内部处理 length 续写、prompt-too-long 压缩、429/529 退避与 fallback；
+// 取消和总 deadline 贯穿所有异步操作，每个 typed failure 都是可验证的终止条件。
 export const DEFAULT_INITIAL_MAX_TOKENS = 8_000;
 export const DEFAULT_ESCALATED_MAX_TOKENS = 64_000;
 export const DEFAULT_MAX_CONTINUATIONS = 3;
@@ -45,6 +48,7 @@ export class RecoveryRetriesExhausted extends RecoveryError {
 }
 
 // 轻量取消令牌允许测试手动触发，并与 AbortSignal 一起约束所有异步操作。
+// 契约：cancel() 幂等且只触发一次；取消后新增订阅会立即执行，并返回 no-op 退订函数。
 export class CancellationToken {
   #cancelled = false;
   readonly #listeners = new Set<() => void>();
@@ -54,6 +58,7 @@ export class CancellationToken {
   }
 
   cancel(): void {
+    // 已取消时直接返回；否则一次性触发全部监听器并清空，保证不重复通知。
     if (this.#cancelled) {
       return;
     }
@@ -68,6 +73,7 @@ export class CancellationToken {
     if (typeof listener !== "function") {
       throw new TypeError("listener must be a function");
     }
+    // 取消后订阅立即唤醒调用方，避免错过已经发生的取消事件。
     if (this.#cancelled) {
       listener();
       return () => {};
@@ -81,12 +87,18 @@ export class CancellationToken {
 
 // 构造时校验预算关系，避免运行期把供应商不接受的 maxTokens 发出去。
 export interface RecoveryConfigOptions {
+  // 主模型连续过载时切换到的备用模型名称。
   readonly primaryModel: string;
   readonly fallbackModel: string;
+  // 首次请求的输出预算；length 后提升到 escalatedMaxTokens。
   readonly initialMaxTokens?: number;
+  // 长度恢复阶段使用的第二档预算，不能超过模型上限。
   readonly escalatedMaxTokens?: number;
+  // 供应商允许的最大输出预算，保护配置不会发出非法值。
   readonly modelMaxTokens?: number;
+  // 同一逻辑请求最多追加的纯文本续写次数。
   readonly maxContinuations?: number;
+  // 429/529 等瞬态失败的总尝试上限。
   readonly maxTransientAttempts?: number;
   readonly baseDelaySeconds?: number;
   readonly maxDelaySeconds?: number;
@@ -167,17 +179,25 @@ export class RecoveryConfig {
 
 // 回合内可变恢复状态只由 RecoveryManager 持有，外部通过只读快照观察。
 export interface RecoveryState {
+  // 当前实际发送请求所用模型和输出预算。
   currentModel: string;
   currentMaxTokens: number;
+  // 是否已经从初始预算升级，避免重复升级分支。
   hasEscalated: boolean;
+  // 已追加的续写片段数量。
   recoveryCount: number;
+  // 连续 529 次数，达到阈值后切换 fallback。
   consecutive529: number;
+  // 当前窗口是否已执行 prompt-too-long 响应式压缩。
   hasAttemptedReactiveCompact: boolean;
 }
 
 export interface RecoveryManagerOptions {
+  // 原始模型调用边界，所有重试仍归属于同一逻辑请求。
   readonly model: ModelClient;
+  // prompt-too-long 时复用的上下文压缩器。
   readonly compaction: CompactionManager;
+  // 固定的预算、退避、fallback 和 deadline 约束。
   readonly config: RecoveryConfig;
   readonly monotonic?: () => number;
   readonly utcNow?: () => Date;
@@ -197,6 +217,7 @@ export class RecoveryManager {
   readonly #jitter: (upperBound: number) => number;
   readonly #cancellation: CancellationToken;
   #state: RecoveryState | undefined;
+  // 单回合总 deadline；重试、sleep 和压缩共享此截止时间。
   #deadline: number | undefined;
 
   constructor(options: RecoveryManagerOptions) {
@@ -265,6 +286,8 @@ export class RecoveryManager {
     // 外部 AbortSignal 与内部 CancellationToken 共用同一取消边界，调用方可以主动中断。
     const state = this.#requireState();
     validateToolPairing(request.messages);
+    // complete() 只接受外部 Loop 的原始请求：model 必须仍是 primary、maxTokens 必须是 initial。
+    // RecoveryManager 内部的覆盖只通过局部 state/effectiveRequest 发生，防止调用方绕过恢复状态。
     if (request.model !== undefined && request.model !== this.#config.primaryModel) {
       throw new RangeError("request.model must match RecoveryConfig.primaryModel");
     }
@@ -285,6 +308,7 @@ export class RecoveryManager {
 
     while (true) {
       // 循环只在一个逻辑请求内重试：长度升级、续写、压缩和瞬态退避都返回同一个 ModelReply。
+      // 每次尝试都重建完整请求快照；model/maxTokens 随恢复状态变化。
       const effectiveRequest: ModelRequest = Object.freeze({
         ...request,
         messages: requestMessages,

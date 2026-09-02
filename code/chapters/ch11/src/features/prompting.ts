@@ -10,6 +10,7 @@ import { ToolRegistry } from "../core/tools.js";
 // JSON 类型只允许可稳定序列化的值，函数、符号、Date 等对象不进入 Prompt。
 export type JsonScalar = boolean | number | string | null;
 export interface JsonObject {
+  // 仅允许字符串键；值递归受 JsonValue 约束，保证可稳定序列化。
   readonly [key: string]: JsonValue;
 }
 
@@ -21,18 +22,27 @@ export class PromptContextError extends Error {
 }
 
 export interface DynamicPromptRendererOptions {
+  // Prompt 可见的身份文本，渲染前会 trim 并拒绝空值。
   readonly identity: string;
+  // 工具名称快照决定 tools section 和缓存键。
   readonly tools: ToolRegistry;
+  // 规范化绝对工作区路径，供模型理解当前操作边界。
   readonly workspace: string;
+  // 额外结构化上下文；不得包含函数、循环引用或非有限数。
   readonly context: JsonObject;
+  // 可选 Skill 摘要来源，正文仍由 SkillRegistry 按需加载。
   readonly skills?: SkillRegistry;
+  // 可选记忆会话，只读取当前回合已选择的记忆。
   readonly memory?: MemorySession;
 }
 
 export class DynamicPromptRenderer {
   // 缓存键覆盖所有模型可见输入，任何工具、记忆或 Skill 变化都会失效。
+  // 上一次完整输入的稳定 JSON 键；不同 section 数据不会误命中缓存。
   #lastKey: string | undefined;
+  // 与 #lastKey 对应的最终 prompt 文本。
   #lastPrompt: string | undefined;
+  // 仅用于观测缓存复用次数，不影响渲染结果。
   #cacheHits = 0;
 
   // 缓存命中次数用于测试和观测，证明相同输入不会重复组装字符串。
@@ -104,6 +114,7 @@ export class DynamicPromptRenderer {
 }
 
 export interface DynamicPromptProviderOptions extends DynamicPromptRendererOptions {
+  // Provider 复用该 renderer 的缓存和规范化逻辑。
   readonly renderer: DynamicPromptRenderer;
 }
 

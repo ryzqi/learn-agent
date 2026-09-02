@@ -1,3 +1,4 @@
+// 工具注册表：集中保存 schema/effect/handler，解析并冻结调用参数后交给策略与 handler。
 import { z } from "zod";
 
 import type { ToolCall } from "./messages.js";
@@ -48,6 +49,8 @@ export function copyToolResult(result: ToolResult): ToolResult {
   return Object.freeze({ content: result.content, isError: true, errorCode });
 }
 
+// ToolDefinition 由 feature 自己持有；SkillRegistry 用它注册 load_skill，
+// 同一份 Zod schema 既生成模型参数定义，也在 handler 前重新校验输入。
 export interface ToolDefinition<Input> {
   readonly name: string;
   readonly description: string;
@@ -72,6 +75,7 @@ export interface PreparedToolCall {
 }
 
 export function freezePreparedToolCall(
+  // 使用 structuredClone 复制参数并递归冻结，防止 approval 与 handler 接触外部变异。
   call: ToolCall,
   definition: StoredToolDefinition,
   argumentsValue: unknown,
@@ -84,6 +88,7 @@ export function freezePreparedToolCall(
 }
 
 export class ToolRegistry {
+  // 工具注册表按名称索引所有定义，prepare 做 JSON 解析与 Zod 校验。
   readonly #definitions: Map<string, StoredToolDefinition>;
   readonly #mutable: boolean;
 
@@ -140,8 +145,10 @@ export class ToolRegistry {
     );
   }
 
+  // JSON 解析和 Zod 校验先于权限策略；错误直接返回结构化工具错误。
   prepare(call: ToolCall): PreparedToolCall {
     // 解析与 schema 校验先于权限策略；策略永远面对可信的工具定义和参数。
+    // JSON 解析与 Zod 校验先于权限策略；错误直接返回结构化工具错误，策略始终面对可信定义和参数。
     const definition = this.#definitions.get(call.name);
     if (definition === undefined) {
       return { call, error: toolError("unknown_tool", `Unknown tool: ${call.name}`) };

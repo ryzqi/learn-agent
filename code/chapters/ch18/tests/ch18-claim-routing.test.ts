@@ -107,14 +107,12 @@ describe("chapter 18 claim routing", () => {
       name: "alice",
       integrationRef: "refs/heads/main",
     });
-    const claim = await worktrees.claimNext("alice");
-    if (claim === undefined) throw new Error("expected active bound task");
     const context: ToolContext = Object.freeze({
       workspace: root,
       identity: "alice",
-      claimToken: claim.claimToken,
       executionScope: Object.freeze({}),
     });
+    const claim = await worktrees.claimTask(task.id, context);
     await worktrees.completeTask(task.id, claim.claimToken, context);
 
     await expect(worktrees.resolve(context)).rejects.toBeInstanceOf(WorktreeContextError);

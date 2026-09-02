@@ -1,5 +1,6 @@
 // SQLite 任务存储：独立持久化 P17 的 DAG、租约与 claim token；每个事务都在进程队列、文件锁和 BEGIN IMMEDIATE 下原子完成。
 import { randomUUID } from "node:crypto";
+import type { Stats } from "node:fs";
 import { lstat, mkdir, open, readFile, realpath, rename, rm, stat } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -414,7 +415,9 @@ export class SqliteTaskStore implements LeasedTaskStore {
       throw new TaskStorageError("SQLite Task storage root escapes workspace");
     }
     if (await pathExists(paths.database)) await validateDatabaseFile(paths);
-    if ((await pathExists(paths.lock)) && (await lstat(paths.lock)).isSymbolicLink()) {
+    // 只做一次 lstat：锁文件若在"探测存在"与"读取元信息"之间被释放，两次 syscall 会误报错误。
+    const lockInfo = await lstatIfExists(paths.lock);
+    if (lockInfo?.isSymbolicLink()) {
       throw new TaskStorageError("SQLite Task lock path must not be a symbolic link");
     }
   }
@@ -543,8 +546,8 @@ async function persistDatabase(path: string, content: Uint8Array): Promise<void>
 
 async function validateDatabaseTargetBeforeOpen(paths: SqlitePaths): Promise<void> {
   // 打开前检查可防止 sql.js 跟随符号链接读取工作区外数据库。
-  if (!(await pathExists(paths.database))) return;
-  const information = await lstat(paths.database);
+  const information = await lstatIfExists(paths.database);
+  if (information === undefined) return;
   if (information.isSymbolicLink()) {
     throw new TaskStorageError("SQLite Task database escapes workspace or is not a regular file");
   }
@@ -732,15 +735,19 @@ function pathIsInside(parent: string, child: string): boolean {
   return pathFromParent === "" || (!pathFromParent.startsWith("..") && !isAbsolute(pathFromParent));
 }
 
-async function pathExists(path: string): Promise<boolean> {
+async function lstatIfExists(path: string): Promise<Stats | undefined> {
+  // 一次 syscall 同时得到"是否存在"和元信息，调用方无需再补一次 lstat。
   // 仅把 ENOENT 视为不存在，权限或 I/O 错误继续上抛。
   try {
-    await lstat(path);
-    return true;
+    return await lstat(path);
   } catch (error) {
-    if (hasErrorCode(error, "ENOENT")) return false;
+    if (hasErrorCode(error, "ENOENT")) return undefined;
     throw error;
   }
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  return (await lstatIfExists(path)) !== undefined;
 }
 
 function hasErrorCode(error: unknown, code: string): boolean {

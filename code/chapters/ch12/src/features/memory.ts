@@ -18,6 +18,7 @@ import {
 import type { ChatMessage, ToolCall } from "../core/messages.js";
 import type { ModelClient } from "../core/model.js";
 
+// memory.ts 负责第 9 章的文件级记忆：安全记录、manifest 权威集合、模型 side-query 与回合生命周期。
 const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const MEMORY_FILENAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*\.md$/;
 const CJK_RUN_PATTERN = /[\u3400-\u4dbf\u4e00-\u9fff]+/gu;
@@ -32,14 +33,22 @@ const MAX_WINDOWS_LOCK_RACE_RETRIES = 100;
 // 进程内互斥尾链：同进程并发回合先排队，再尝试跨进程文件锁。
 const PROCESS_LOCK_TAILS = new Map<string, Promise<void>>();
 
+// 三个 side-query 输出都直接进入 JSON.parse()，不做围栏剥离或子串截取；
+// 因此系统提示必须明确禁止 Markdown 代码块和解释文字，降低真实模型附加围栏的概率。
+const NO_FENCE_INSTRUCTION =
+  "直接输出纯 JSON 文本，禁止使用 Markdown 代码块或反引号包裹，禁止输出任何解释文字。";
 const SELECTOR_SYSTEM_PROMPT = `从目录中选择与查询直接相关的记忆名称。
-只能返回 JSON 字符串数组，不得调用工具；没有相关项时返回 []。`;
+只能返回 JSON 字符串数组，不得调用工具；没有相关项时返回 []。
+${NO_FENCE_INSTRUCTION}`;
 const EXTRACTOR_SYSTEM_PROMPT = `从会话中提取值得跨会话保留的新记忆。
 只能返回 JSON 数组，不得调用工具。每项必须且只能包含 name、type、description、body；
-type 只能是 user、feedback、project、reference，没有新记忆时返回 []。`;
+type 只能是 user、feedback、project、reference，没有新记忆时返回 []。
+name 必须是安全的小写 slug：只能包含小写字母、数字，多个词之间用单个连字符 - 分隔，禁止下划线、空格、大写字母或中文字符。
+${NO_FENCE_INSTRUCTION}`;
 const CONSOLIDATOR_SYSTEM_PROMPT = `整理给定记忆，合并重复或冲突内容，不得调用工具。
 只能返回 JSON object，必须且只能包含 source_names 和 records；
-source_names 是被替换的原记忆名称，records 是非空的新记忆数组。`;
+source_names 是被替换的原记忆名称，records 是非空的新记忆数组。
+${NO_FENCE_INSTRUCTION}`;
 
 export class MemoryStoreError extends Error {
   // 文件记忆的名称、索引和正文必须作为一个受锁保护的持久化集合维护。
@@ -53,13 +62,18 @@ export const MemoryType = Object.freeze({
   REFERENCE: "reference",
 } as const);
 
+// 记忆类别用于选择和整理阶段的稳定路由，不允许模型写入其他类型。
 export type MemoryType = (typeof MemoryType)[keyof typeof MemoryType];
 
 // MemoryRecord 是不可变值对象；名称直接决定文件名，因此先做安全 slug 校验再落盘。
 export interface MemoryRecordOptions {
+  // slug 同时作为逻辑名称和文件名的一部分，必须保持稳定且安全。
   readonly name: string;
+  // 目录索引展示的一行摘要。
   readonly description: string;
+  // 便于按用户偏好、反馈、项目或参考资料分类。
   readonly kind: MemoryType;
+  // 记忆正文，序列化前会统一换行并执行大小预算。
   readonly body: string;
 }
 
@@ -149,6 +163,7 @@ export class ModelMemoryQueries implements MemorySelector, MemoryExtractor, Memo
   }
 
   async #complete(messages: readonly ChatMessage[]): Promise<string> {
+    // 三个 memory side-query 都强制无工具、stop 和非空完整文本；JSON 解析交给调用方。
     const reply = await this.#model.complete(
       Object.freeze({ messages: Object.freeze([...messages]), tools: Object.freeze([]) }),
     );
@@ -188,9 +203,13 @@ interface MemoryStorePaths {
 }
 
 export interface MemoryStoreOptions {
+  // 所有 .memory 文件都归属于此工作区，不能跨工作区读取。
   readonly workspace: string;
+  // 生成记录文件后缀的 slug 工厂，可在测试中固定。
   readonly idGenerator?: () => string;
+  // 派生 MEMORY.md 索引的行数上限。
   readonly maxIndexLines?: number;
+  // 派生 MEMORY.md 索引的 UTF-8 字节上限。
   readonly maxIndexBytes?: number;
 }
 
@@ -201,6 +220,7 @@ export interface ApplyConsolidationOptions {
   readonly replacements: readonly MemoryRecord[];
 }
 
+// MemoryStore 是记忆集合的唯一事务入口，所有读改写都通过进程内队列与文件锁串行。
 export class MemoryStore {
   // 存取均经进程内互斥和跨进程文件锁，避免并发回合破坏索引与记录一致性。
   readonly #workspaceInput: string;
@@ -226,7 +246,9 @@ export class MemoryStore {
     this.#maxIndexBytes = maxIndexBytes;
   }
 
+  // 读取记录：根目录不存在视为空集合，存在时先校验边界，再在锁内按 manifest 加载。
   async records(): Promise<readonly MemoryRecord[]> {
+    // 读取入口：目录不存在时视为空集合；存在时必须先校验根目录，再在锁内按 manifest 重读集合。
     const paths = await this.#resolvePaths();
     if (!(await pathExists(paths.root))) {
       return Object.freeze([]);
@@ -237,7 +259,9 @@ export class MemoryStore {
     );
   }
 
+  // 渲染目录：只读取轻量索引，不把正文拼进模型上下文。
   async renderCatalog(): Promise<string> {
+    // 目录入口只返回 name、文件名和单行描述，selector 不直接读取全部正文。
     const paths = await this.#resolvePaths();
     if (!(await pathExists(paths.root))) {
       return "";
@@ -252,7 +276,9 @@ export class MemoryStore {
     await this.extend([record]);
   }
 
+  // 新增记忆：先拒绝重名，再独占写正文文件，最后原子提交 manifest 和 MEMORY.md。
   async extend(records: readonly MemoryRecord[]): Promise<void> {
+    // extend() 只追加新名称；同一名称重复写入会在锁内失败，避免静默覆盖已有记忆。
     const validated = validateRecordCollection(records, true);
     if (validated.length === 0) {
       return;
@@ -302,7 +328,9 @@ export class MemoryStore {
     });
   }
 
+  // 合并记忆：先校验 base 未漂移，再写新文件并提交，成功后才删除被替换的旧文件。
   async applyConsolidation(options: ApplyConsolidationOptions): Promise<void> {
+    // 整理事务：先在锁内重读 manifest，发现 baseRecords 已变化立即失败；提交后才清理被替换的旧文件。
     const base = validateRecordCollection(options.baseRecords, true);
     const additions = validateRecordCollection(options.additions, true);
     const replacements = validateRecordCollection(options.replacements, false);
@@ -590,7 +618,9 @@ export class MemorySession {
   readonly #maxSelected: number;
   readonly #consolidateThreshold: number;
   readonly #emitContextMessages: boolean;
+  // 当前回合选中的只读快照；下一回合 beginTurn 会完全替换。
   #selected: readonly MemoryRecord[] = Object.freeze([]);
+  // 记忆 side-query 或持久化失败只记录在此，不阻断主 Agent 回答。
   #lastError: string | undefined;
 
   constructor(options: MemorySessionOptions) {
@@ -618,6 +648,7 @@ export class MemorySession {
   }
 
   // 回合开始先读当前集合；模型选择失败时使用确定性关键词回退，不让记忆问题中断主任务。
+  // 回合前选择相关记忆；模型选择失败时退回确定性关键词匹配。
   async beginTurn(query: string): Promise<void> {
     const records = await this.#store.records();
     this.#selected = Object.freeze([]);
@@ -672,6 +703,7 @@ export class MemorySession {
   }
 
   // 回合结束用完整 canonical history 提取；提取、整理或写入失败只记录 lastError，不改变旧集合。
+  // 回合结束从完整 canonical history 提取并追加或整理记忆。
   async complete(history: readonly ChatMessage[]): Promise<void> {
     const current = await this.#store.records();
     let candidate = current;

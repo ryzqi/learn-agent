@@ -180,12 +180,18 @@ export function registerTaskTools(registry: ToolRegistry, store: TaskStore): voi
   registry.register(createTaskDefinition(store));
   registry.register(
     // get_task 是只读查询，不改变状态或 owner。
-    taskIdDefinition("get_task", "Read one persistent project task by ID.", "read", store),
+    taskIdDefinition(
+      "get_task",
+      "Read one persistent project task by canonical UUID. Read-only; it does not change status or owner.",
+      "read",
+      store,
+    ),
   );
   registry.register({
     name: "list_tasks",
     // 返回完整图快照，调用方才能根据依赖和 ready 状态做规划。
-    description: "List the complete persistent project task graph.",
+    description:
+      "List the complete persistent project task graph sorted by ID. Use it before create_task to find canonical UUIDs or before claim_task to find ready tasks.",
     inputSchema: listTasksInputSchema,
     effect: "read",
     handler: async (_input, _context) => {
@@ -202,7 +208,7 @@ export function registerTaskTools(registry: ToolRegistry, store: TaskStore): voi
     // claim 的 owner 只来自 ToolContext.identity，模型不能选择替谁完成任务。
     taskIdDefinition(
       "claim_task",
-      "Atomically claim a ready pending task as the current identity.",
+      "Atomically claim a ready pending task as the current identity. Owner is set by the runtime identity; do not pass an owner argument.",
       "write",
       store,
     ),
@@ -210,7 +216,8 @@ export function registerTaskTools(registry: ToolRegistry, store: TaskStore): voi
   registry.register({
     name: "complete_task",
     // 完成者只能来自可信 ToolContext.identity。
-    description: "Complete a claimed task owned by the current identity.",
+    description:
+      "Complete a claimed task owned by the current identity. Returns the completed task and any pending tasks directly unblocked by this completion.",
     inputSchema: taskIdInputSchema,
     effect: "write",
     handler: async (input, context) => {
@@ -236,7 +243,8 @@ function createTaskDefinition(store: TaskStore): ToolDefinition<z.infer<typeof c
   return {
     name: "create_task",
     // blocked_by 必须引用 list_tasks/get_task 返回的规范 UUID。
-    description: "Create a persistent project task with explicit dependencies.",
+    description:
+      "Create a persistent project task after planning. blocked_by must contain canonical task UUIDs returned by list_tasks or get_task.",
     inputSchema: createTaskSchema,
     effect: "write",
     handler: async (input) => {

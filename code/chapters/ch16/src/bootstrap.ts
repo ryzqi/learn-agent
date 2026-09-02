@@ -13,7 +13,11 @@ import type { ChapterProfile } from "./core/profiles.js";
 import { profileForChapter } from "./core/profiles.js";
 import type { ToolRegistry } from "./core/tools.js";
 import { createChapterOneTools, createChapterTwoTools } from "./features/builtin-tools.js";
-import { BackgroundDispatcher, type JobSupervisor } from "./features/background.js";
+import {
+  BackgroundDispatcher,
+  registerBackgroundJobTools,
+  type JobSupervisor,
+} from "./features/background.js";
 import type { CronRuntime } from "./features/cron.js";
 import type { TeammateRuntime } from "./features/teammates.js";
 import type { ProtocolRuntime } from "./features/protocol.js";
@@ -217,6 +221,10 @@ export function buildAgent(profile: ChapterProfile, dependencies: BuildDependenc
   }
   if (dependencies.taskStore !== undefined) {
     registerTaskTools(tools, dependencies.taskStore);
+  }
+  if (dependencies.backgroundSupervisor !== undefined) {
+    // 主 Agent 注册后台查询与取消工具；子 Agent 不接收后台 Supervisor，因此不暴露这些能力。
+    registerBackgroundJobTools(tools, dependencies.backgroundSupervisor);
   }
   if (dependencies.cronRuntime !== undefined) {
     tools.register(dependencies.cronRuntime.toolDefinition);

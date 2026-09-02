@@ -245,15 +245,17 @@ describe("chapter 19 MCP stdio runtime", () => {
   });
 
   test("maps remote error, timeout, and process exit without leaking private details", async () => {
+    // 每个用例自带工具超时：只有 delay 需要极短超时来触发 mcp_timeout；
+    // fail 和 terminate 依赖远端错误与连接断开先到达，短超时会让 mcp_timeout 抢先命中。
     const cases = [
-      ["fail", {}, "mcp_remote_error", true],
-      ["delay", { milliseconds: 100 }, "mcp_timeout", false],
-      ["terminate", {}, "mcp_connection_lost", false],
+      ["fail", {}, "mcp_remote_error", true, 2],
+      ["delay", { milliseconds: 100 }, "mcp_timeout", false, 0.02],
+      ["terminate", {}, "mcp_connection_lost", false, 2],
     ] as const;
-    for (const [tool, argumentsValue, errorCode, survives] of cases) {
+    for (const [tool, argumentsValue, errorCode, survives, toolTimeoutSeconds] of cases) {
       const registry = new ToolRegistry();
       const runtime = new McpRuntime({
-        servers: [demoSpec("demo_alpha", "alpha", 0.02)],
+        servers: [demoSpec("demo_alpha", "alpha", toolTimeoutSeconds)],
         connectionFactory: new StdioMcpConnectionFactory(),
         schemaValidator: new AjvMcpSchemaValidator(),
       });

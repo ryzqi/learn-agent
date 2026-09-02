@@ -1,4 +1,7 @@
 // OpenAI SDK 仅存在于此 adapter，core 不依赖供应商类型。
+// 文件职责：本模块是唯一直接依赖 OpenAI SDK 的供应商适配层，core 不导入供应商类型。
+// 它负责三件事：把内部 ModelRequest 映射成 OpenAI wire 格式、把 HTTP 错误按稳定字段归一成
+// typed model error、把成功响应逐字段校验后转成 ModelReply。
 import OpenAI, { APIError } from "openai";
 import type {
   ChatCompletionAssistantMessageParam,
@@ -24,6 +27,7 @@ import type {
 import type { OpenAISettings } from "../config.js";
 
 // 成功响应未通过结构校验时抛出此错误，绝不猜测字段类型。
+// 成功响应未通过结构校验时抛出此错误。供应商返回 200 不保证结构可信，绝不猜测字段类型。
 export class OpenAIResponseError extends Error {
   override readonly name = "OpenAIResponseError";
 }
@@ -44,6 +48,7 @@ export class OpenAIChatModel implements ModelClient {
   readonly #client: OpenAIClientBoundary;
   readonly #model: string;
 
+  // 默认创建真实 OpenAI 客户端，并把 SDK 自带重试关闭为 0；重试决策统一交给恢复层。
   constructor(settings: OpenAISettings, client?: OpenAIClientBoundary) {
     this.#client =
       client === undefined
@@ -58,6 +63,8 @@ export class OpenAIChatModel implements ModelClient {
   }
 
   // 先校验请求，再调用供应商；signal 直接透传给网络层。
+  // complete() 是供应商边界：先拒绝不满足协议的请求，再调用 OpenAI SDK。
+  // signal 直接透传给网络层；返回的成功响应仍按不可信数据做逐字段校验。
   async complete(request: ModelRequest, signal?: AbortSignal): Promise<ModelReply> {
     validateToolPairing(request.messages);
     if (
@@ -188,6 +195,8 @@ interface NormalizedResponse {
 }
 
 // 成功响应属于不可信边界，逐字段校验 OpenAI Chat Completion 结构。
+// 成功响应属于不可信边界。HTTP 200 只代表请求被受理，不代表 choices/message/finish_reason/
+// tool_calls/usage 符合模型接口；这里逐字段校验，任何不匹配都立即失败，避免残缺对象进入恢复层。
 function normalizeResponse(response: unknown): NormalizedResponse {
   if (typeof response !== "object" || response === null) {
     throw new OpenAIResponseError("Chat completion response must be an object");
@@ -242,6 +251,8 @@ function normalizeResponse(response: unknown): NormalizedResponse {
 }
 
 // tool_calls 必须带完整 id/name/arguments，任何缺失都让本轮失败。
+// tool_calls 必须带完整 id/name/arguments。供应商返回缺字段或非法参数时本轮明确失败，
+// 不能把半成品工具调用写进 history，也不能在恢复层猜测补全。
 function normalizeToolCall(call: unknown): ReturnType<typeof toolCall> {
   if (typeof call !== "object" || call === null) {
     throw new OpenAIResponseError("Tool call must be an object");
@@ -274,6 +285,8 @@ function isFinishReason(value: unknown): value is FinishReason {
 }
 
 // ChatMessage 到 OpenAI wire format 的映射，assistant tool_calls 原样保留。
+// ChatMessage 到 OpenAI wire format 的映射。system/user 只传 content；tool 必须带 tool_call_id，
+// 与 assistant 的 tool_calls 配对；assistant 的 tool_calls 原样展开为 function 结构。
 function toOpenAIMessage(message: ChatMessage): ChatCompletionMessageParam {
   switch (message.role) {
     case "system":
@@ -299,6 +312,7 @@ function toOpenAIMessage(message: ChatMessage): ChatCompletionMessageParam {
 }
 
 // 工具 schema 直接映射，OpenAI 只接受 function 类型。
+// 工具 schema 直接映射为 OpenAI 接受的 function 对象；内部契约要求 type 固定为 "function"。
 function toOpenAITool(tool: ModelRequest["tools"][number]): ChatCompletionTool {
   return {
     type: "function",
@@ -311,6 +325,7 @@ function toOpenAITool(tool: ModelRequest["tools"][number]): ChatCompletionTool {
 }
 
 // usage 字段为不可信输入，缺少或非负整数失败。
+// usage 字段不是纯诊断信息，可能被外部服务或代理改写；缺少任一计数或出现负数/小数时本轮失败。
 function normalizeUsage(usage: unknown): TokenUsage {
   if (typeof usage !== "object" || usage === null) {
     throw new OpenAIResponseError("Chat completion usage must be an object");
@@ -327,6 +342,7 @@ function normalizeUsage(usage: unknown): TokenUsage {
 
 function readUsageCount(usage: object, field: string): number {
   const value = Reflect.get(usage, field);
+  // 计数必须是可枚举的非负整数；浮点、NaN、负数都属于结构违约。
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
     throw new OpenAIResponseError(
       `Chat completion usage field ${field} must be non-negative integer`,

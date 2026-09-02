@@ -4,7 +4,7 @@
 
 This repository contains a 20-part, Chinese-language series about building AI agents. Each numbered Markdown file at the repository root is one article; the numeric prefix defines the reading order. Keep an article's prose, diagrams, tables, and code samples together in that file. Images are currently referenced by remote Markdown URLs rather than stored locally.
 
-Runnable companion code lives in `code/`. Each chapter owns a complete runnable TypeScript snapshot under `code/chapters/chNN/src/`, with its cumulative behavioral tests under `code/chapters/chNN/tests/`; do not reintroduce shared root `code/src/` or `code/tests/` copies. Treat `code/ARCHITECTURE.md` and `code/CHAPTER_CONTRACTS.md` as the implementation and acceptance sources of truth.
+Runnable companion code lives in `code/`. Each chapter owns a complete runnable TypeScript snapshot under `code/chapters/chNN/src/`, with its cumulative behavioral tests under `code/chapters/chNN/tests/`; do not reintroduce shared root `code/src/` or `code/tests/` copies. Treat each chapter's own `src/` snapshot plus its `tests/` suite as the implementation and acceptance sources of truth; `code/package.json` scripts (`test:chNN`, `lint`, `format:check`, `verify:snapshot-drift`) are the gates.
 
 ## Build, Test, and Development Commands
 
@@ -78,4 +78,4 @@ For every article edit, read back the complete changed article, confirm fenced b
 
 ## Commit & Pull Request Guidelines
 
-This directory has no Git metadata, so no project-specific commit convention can be inferred. When contributing through Git, use a concise imperative subject, for example `docs: clarify Agent Loop tool handling`. Keep each commit focused on one article or one shared correction. Pull requests should identify affected article numbers, summarize substantive changes, explain technical corrections, and link the relevant issue when one exists. Include a rendered screenshot only when formatting, tables, or image placement changed.
+This directory is a Git repository. Its history uses Conventional Commit types with a chapter scope and a Simplified Chinese subject, for example `docs(ch20): 重写 Full Harness 整合教程`. Follow that convention. Keep each commit focused on one article or one shared correction. Pull requests should identify affected article numbers, summarize substantive changes, explain technical corrections, and link the relevant issue when one exists. Include a rendered screenshot only when formatting, tables, or image placement changed.

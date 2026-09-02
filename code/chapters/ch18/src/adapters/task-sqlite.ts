@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { Stats } from "node:fs";
 import { lstat, mkdir, open, readFile, realpath, rename, rm, stat } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -655,7 +656,8 @@ export class SqliteTaskStore implements LeasedTaskStore, WorktreeStore {
       throw new TaskStorageError("SQLite Task storage root escapes workspace");
     }
     if (await pathExists(paths.database)) await validateDatabaseFile(paths);
-    if ((await pathExists(paths.lock)) && (await lstat(paths.lock)).isSymbolicLink()) {
+    const lockInfo = await lstatIfExists(paths.lock);
+    if (lockInfo?.isSymbolicLink()) {
       throw new TaskStorageError("SQLite Task lock path must not be a symbolic link");
     }
   }
@@ -830,8 +832,8 @@ async function persistDatabase(path: string, content: Uint8Array): Promise<void>
 
 // 打开前只允许普通文件数据库，拒绝符号链接或目录目标。
 async function validateDatabaseTargetBeforeOpen(paths: SqlitePaths): Promise<void> {
-  if (!(await pathExists(paths.database))) return;
-  const information = await lstat(paths.database);
+  const information = await lstatIfExists(paths.database);
+  if (information === undefined) return;
   if (information.isSymbolicLink()) {
     throw new TaskStorageError("SQLite Task database escapes workspace or is not a regular file");
   }
@@ -1146,15 +1148,20 @@ function pathIsInside(parent: string, child: string): boolean {
   return pathFromParent === "" || (!pathFromParent.startsWith("..") && !isAbsolute(pathFromParent));
 }
 
-// 将 ENOENT 转为 false，其他 IO 错误继续抛出。
-async function pathExists(path: string): Promise<boolean> {
+// 一次 lstat 同时得到"是否存在"和元信息：路径不存在返回 undefined，其他 IO 错误继续抛出。
+// 调用方据此避免"先探测存在再取元信息"的两次 syscall——锁文件在两次之间被释放会误报错误。
+async function lstatIfExists(path: string): Promise<Stats | undefined> {
   try {
-    await lstat(path);
-    return true;
+    return await lstat(path);
   } catch (error) {
-    if (hasErrorCode(error, "ENOENT")) return false;
+    if (hasErrorCode(error, "ENOENT")) return undefined;
     throw error;
   }
+}
+
+// 将 ENOENT 转为 false，其他 IO 错误继续抛出。
+async function pathExists(path: string): Promise<boolean> {
+  return (await lstatIfExists(path)) !== undefined;
 }
 
 // 从任意 Error-like 对象读取 code，供 Windows 文件锁竞态判断使用。

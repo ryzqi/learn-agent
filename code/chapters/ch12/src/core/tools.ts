@@ -1,3 +1,4 @@
+// 工具注册表：集中保存 schema/effect/handler，解析并冻结调用参数后交给策略与 handler。
 import { z } from "zod";
 
 import type { ToolCall } from "./messages.js";
@@ -5,6 +6,7 @@ import { toolCall } from "./messages.js";
 import type { OpenAIToolSchema } from "./model.js";
 
 // effect 是权限策略和工具列表可见性的最小事实来源，不依赖工具名称猜测。
+// effect 是权限策略判断副作用的语义标签，而不是执行方式。
 export type EffectClass = "read" | "write" | "execute" | "external";
 
 export interface ToolContext {
@@ -50,6 +52,8 @@ export function copyToolResult(result: ToolResult): ToolResult {
   return Object.freeze({ content: result.content, isError: true, errorCode });
 }
 
+// ToolDefinition 由 feature 自己持有；SkillRegistry 用它注册 load_skill，
+// 同一份 Zod schema 既生成模型参数定义，也在 handler 前重新校验输入。
 export interface ToolDefinition<Input> {
   readonly name: string;
   readonly description: string;
@@ -75,6 +79,7 @@ export interface PreparedToolCall {
 }
 
 export function freezePreparedToolCall(
+  // 使用 structuredClone 复制参数并递归冻结，防止 approval 与 handler 接触外部变异。
   call: ToolCall,
   definition: StoredToolDefinition,
   argumentsValue: unknown,
@@ -87,6 +92,7 @@ export function freezePreparedToolCall(
 }
 
 export class ToolRegistry {
+  // 工具注册表按名称索引所有定义，prepare 做 JSON 解析与 Zod 校验。
   readonly #definitions: Map<string, StoredToolDefinition>;
   readonly #mutable: boolean;
 
@@ -128,6 +134,7 @@ export class ToolRegistry {
 
   snapshot(): ToolRegistry {
     // snapshot 用于给子 Agent 等边界提供只读工具视图，不能继续注册新工具。
+    // 每轮使用不可变快照，避免模型请求与执行之间的注册表被篡改。
     return new ToolRegistry(this.#definitions, false);
   }
 
@@ -145,8 +152,11 @@ export class ToolRegistry {
     );
   }
 
+  // JSON 解析和 Zod 校验先于权限策略；错误直接返回结构化工具错误。
   prepare(call: ToolCall): PreparedToolCall {
     // 参数是不可信输入：先解析 JSON，再按 schema 校验，最后冻结完整调用快照。
+    // 解析与 schema 校验先于权限策略；策略永远面对可信的工具定义和参数。
+    // JSON 解析与 Zod 校验先于权限策略；错误直接返回结构化工具错误，策略始终面对可信定义和参数。
     const definition = this.#definitions.get(call.name);
     if (definition === undefined) {
       return { call, error: toolError("unknown_tool", `Unknown tool: ${call.name}`) };

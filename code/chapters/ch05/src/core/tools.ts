@@ -142,8 +142,10 @@ export class ToolRegistry {
     );
   }
 
+  // JSON 解析和 Zod 校验先于权限策略；错误直接返回结构化工具错误。
   prepare(call: ToolCall): PreparedToolCall {
     // JSON 解析与 Zod 校验先于权限策略；错误直接返回结构化工具错误，策略始终面对可信定义和参数。
+    // 解析与 schema 校验先于权限策略；策略永远面对可信的工具定义和参数。
     const definition = this.#definitions.get(call.name);
     if (definition === undefined) {
       return { call, error: toolError("unknown_tool", `Unknown tool: ${call.name}`) };

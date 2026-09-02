@@ -98,21 +98,27 @@ export type ToolResultProcessor = (
 
 // 工具分派器保留原同步执行路径的返回值契约；后台作业先返回占位结果，再通过事件泵补交终态。
 export interface ToolDispatcher {
+  // 接收已通过 schema 校验的工具调用，并返回统一 ToolResult。
   dispatch(prepared: PreparedToolCall, context: ToolContext): Promise<ToolResult>;
 }
 
 // 事件泵是外部运行时到 Agent Loop 的单向通道：drain 取已就绪事件，waitForEvents 等待 pending 工作，acknowledgeEvents 标记已消费。
 export interface RuntimeEventPump {
+  // 外部运行时是否仍可能产生事件，供 Loop 决定是否等待。
   readonly hasPendingWork: boolean;
+  // 非阻塞取走当前事件批次。
   drainEvents(limit?: number): readonly RuntimeEvent[];
+  // 等待并取走下一批事件。
   waitForEvents(limit?: number): Promise<readonly RuntimeEvent[]>;
   // ack 允许异步完成，调用方必须等待确认后才能安全丢弃事件。
   acknowledgeEvents(events: readonly RuntimeEvent[]): void | Promise<void>;
+  // 可选恢复屏障，首次 drain 前必须完成。
   ready?(): Promise<void>;
 }
 
 // AsyncResource 是 Runner 可管理的关闭边界；由组合根注入，避免核心直接依赖具体后台实现。
 export interface AsyncResource {
+  // Runner 关闭时按资源注入顺序逆序调用。
   close(): Promise<void>;
 }
 
@@ -651,6 +657,7 @@ export class AgentRunner {
         continue;
       }
       // 新事件在 ack 前先写入 history 并登记 id；ack 失败后按事件类型决定回滚或保留重试。
+      // mailbox 是唯一保留半状态的事件类型：已入历史但不重复进模型，重发后仅补 ack，保证至少一次且不重复消费。
       if (isNewEvent) {
         this.#history.push(runtimeEventMessage(event));
         this.#seenEventIds.add(event.eventId);

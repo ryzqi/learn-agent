@@ -550,10 +550,8 @@ export class WorktreeRuntime implements TaskClaimService, ToolContextProvider {
     claimToken: string,
     context: ToolContext,
   ): Promise<TaskCompletion> {
-    // 完成入口同时承担权限证明和 scope 生命周期收尾：store 成功后，
-    // 当前回复不应再凭旧 executionScope 解析出已完成的任务租约。
     // 完成前先用当前 context 重新解析 claim，再核对显式 task/claimToken；
-    // 成功完成后清理 executionScope 映射，避免旧 scope 继续解析到已完成租约。
+    // 完成只更新 store，不修改 executionScope；后续调用仍由 resolve() 按租约重新校验。
     const resolved = await this.resolve(context);
     const normalizedTaskId = canonicalTaskId(taskId);
     const normalizedToken = canonicalClaimToken(claimToken);
@@ -565,12 +563,6 @@ export class WorktreeRuntime implements TaskClaimService, ToolContextProvider {
       context.identity,
       normalizedToken,
     );
-    if (
-      context.executionScope !== undefined &&
-      this.#scopeClaims.get(context.executionScope) === normalizedToken
-    ) {
-      this.#scopeClaims.delete(context.executionScope);
-    }
     return outcome;
   }
 
@@ -652,10 +644,8 @@ export class WorktreeRuntime implements TaskClaimService, ToolContextProvider {
   ): Promise<WorktreeBinding> {
     // 这是所有“无法证明可安全清理”分支的统一出口；保留现状比伪造迁移更安全，
     // 因此 kept/needs_review 不会被重复改写，active 才会追加审计事件。
-    // 清理失败统一落 needs_review；已是 kept 或 needs_review 时保持保留态，避免虚构状态迁移。
-    if (binding.status === WorktreeStatus.NEEDS_REVIEW || binding.status === WorktreeStatus.KEPT) {
-      return binding;
-    }
+    // 清理失败统一落 needs_review；非 active 状态直接保持现状，避免重复或虚构迁移。
+    if (binding.status !== WorktreeStatus.ACTIVE) return binding;
     return await this.#store.markWorktreeNeedsReview(binding.taskId, {
       branchTip,
       reason,

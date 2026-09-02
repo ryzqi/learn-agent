@@ -12,6 +12,7 @@ export class SubprocessGitRunner implements GitRunner {
   readonly #timeoutMs: number;
 
   constructor(timeoutMs = 30_000) {
+    // 超时策略在适配器构造时固定，领域运行时不处理进程级细节。
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       throw new RangeError("timeoutMs must be positive");
     }

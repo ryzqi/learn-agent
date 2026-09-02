@@ -65,37 +65,55 @@ export interface MailboxMessage extends RuntimeEvent {
 
 // 协议消息额外携带 requestId 和 approved；request 只接受 null，response 必须携带布尔决策。
 export interface ProtocolMailboxMessage extends RuntimeEvent {
+  // 传输消息 UUID，同时作为 RuntimeEvent.eventId 和幂等键。
   readonly id: string;
+  // 请求方向为原发起者，响应方向为原目标方。
   readonly sender: string;
+  // 必须与关联请求的相反方向严格匹配。
   readonly recipient: string;
+  // typed kind 决定该消息是请求还是响应，以及对应协议种类。
   readonly kind: ProtocolMessageKind;
+  // 请求正文需与已登记 request 一致；响应正文承载反馈或确认。
   readonly content: string;
+  // 消息创建时间属于传输记录，不替代请求的状态迁移时间。
   readonly createdAtUtc: Date;
+  // 关联 ProtocolStore 中的请求 UUID，而不是当前消息自身 id。
   readonly requestId: string;
+  // 请求固定为 null，响应必须为明确 boolean 决策。
   readonly approved: boolean | null;
+  // Agent Loop 用该值去重事件发布和 ack 重试。
   readonly eventId: string;
+  // 工具执行沿用消息 id，支持协议响应恢复同一 Runner 时去重副作用。
   readonly idempotencyKey: string;
 }
 
+// MailboxItem 让普通协作消息与 typed 协议消息共享同一租约状态机。
 export type MailboxItem = MailboxMessage | ProtocolMailboxMessage;
 
 // Store 暴露发送、认领和确认的协议操作，具体文件持久化留在适配器。
 export interface MailboxStore {
+  // 普通消息与协议消息共用同一套四态迁移，Store 不关心 content 的业务含义。
   send(
     sender: string,
     recipient: string,
     content: string,
     kind: MailboxMessageKind,
   ): Promise<MailboxMessage>;
+  // claim 将最早 ready 消息原子迁移到 processing，并返回其租约快照。
   claim(recipient: string): Promise<MailboxItem | undefined>;
+  // ack 仅接受当前 processing 消息并迁移到 done。
   ack(message: MailboxItem): Promise<boolean>;
+  // release 把取消或可重试失败的 processing 消息退回 ready。
   release(message: MailboxItem): Promise<boolean>;
+  // quarantine 隔离不可重试的畸形或业务失败消息。
   quarantine(message: MailboxItem): Promise<boolean>;
+  // 启动时恢复进程崩溃遗留的 processing 租约，并返回恢复数量。
   recoverProcessing(recipient: string): Promise<number>;
 }
 
 // 只有支持协议消息的 store 才实现 sendProtocol；Runtime 在构造边界做类型判定。
 export interface ProtocolMailboxStore extends MailboxStore {
+  // sendProtocol 在发送时就把 request_id/approved 变成 typed payload，不让模型手工拼 JSON。
   sendProtocol(
     sender: string,
     recipient: string,
@@ -275,6 +293,7 @@ export function mailboxMessageFromJson(value: unknown): MailboxMessage {
 
 // 普通与协议消息共用反序列化入口；先按 kind 分流，再走严格字段校验。
 export function mailboxItemFromJson(value: unknown): MailboxItem {
+  // 联合反序列化先按 kind 分流：普通消息走原 schema，协议消息才允许 request_id/approved。
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new MailboxStorageError("Mailbox message payload is invalid");
   }

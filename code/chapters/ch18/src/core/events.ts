@@ -7,9 +7,11 @@ export interface RuntimeEvent {
   readonly eventId: string;
   readonly contextIdentity?: string;
   readonly idempotencyKey?: string;
+  // 把事件转换为模型可见的纯 JSON payload，不能暴露可变运行时对象。
   toPayload(): Readonly<Record<string, unknown>>;
 }
 
+// 验证来自共享运行时边界的事件最小契约。
 export function isRuntimeEvent(value: unknown): value is RuntimeEvent {
   if (typeof value !== "object" || value === null) {
     return false;
@@ -34,6 +36,7 @@ export class EventInbox {
   readonly #events: RuntimeEvent[] = [];
   readonly #waiters: Array<() => void> = [];
 
+  // 发布事件并唤醒所有等待者；事件所有权随后交给 Inbox。
   publish(event: RuntimeEvent): void {
     if (!isRuntimeEvent(event)) {
       throw new TypeError("EventInbox only accepts RuntimeEvent values");
@@ -44,6 +47,7 @@ export class EventInbox {
     }
   }
 
+  // 按 FIFO 非阻塞取走事件；limit 缺省为当前完整批次。
   drain(limit?: number): readonly RuntimeEvent[] {
     if (limit !== undefined && (!Number.isInteger(limit) || limit <= 0)) {
       throw new Error("limit must be a positive integer or undefined");
@@ -52,6 +56,7 @@ export class EventInbox {
     return Object.freeze(this.#events.splice(0, count));
   }
 
+  // 队列为空时阻塞，出现事件后按同一 drain 规则移交所有权。
   async wait(limit?: number): Promise<readonly RuntimeEvent[]> {
     while (this.#events.length === 0) {
       await new Promise<void>((resolve) => this.#waiters.push(resolve));
@@ -60,6 +65,7 @@ export class EventInbox {
   }
 }
 
+// 将外部事件包装成普通 user message；它不伪造 tool_call_id。
 export function runtimeEventMessage(event: RuntimeEvent): UserMessage {
   // 事件以普通 user 消息进入历史，但不伪装成 tool result，也不携带 tool_call_id。
   if (!isRuntimeEvent(event)) {

@@ -20,6 +20,7 @@ import { profileForChapter } from "./core/profiles.js";
 
 // 终端示例 Hook 只提供可观察性，不改变模型或工具决策。
 class TerminalApprovalProvider implements ApprovalProvider {
+  // 在终端收敛 ask 决策；无 TTY、异常或非肯定回答一律 deny。
   async decide(request: PermissionRequest): Promise<PermissionDecision> {
     const definition = request.prepared.definition;
     const proposed = request.proposedDecision;
@@ -55,6 +56,7 @@ class TerminalApprovalProvider implements ApprovalProvider {
 }
 
 class TerminalAuditSink implements AuditSink {
+  // 将最终权限结论写入 stderr，避免混入最终回答 stdout。
   async record(request: PermissionRequest, decision: PermissionDecision): Promise<void> {
     const definition = request.prepared.definition;
     if (definition === undefined) {
@@ -67,7 +69,9 @@ class TerminalAuditSink implements AuditSink {
 }
 
 interface RunArguments {
+  // 映射为固定 profile 的章节号。
   readonly chapter: number;
+  // 传给 AgentRunner 的用户任务。
   readonly prompt: string;
 }
 
@@ -105,6 +109,7 @@ function parseRunArguments(argv: readonly string[], fixedChapter?: number): RunA
   return { chapter, prompt };
 }
 
+// 真实启动路径：加载配置、模型、文件边界、审批/审计，并在 P04+ 注入可观察 Hook。
 async function execute(profile: ChapterProfile, prompt: string): Promise<number> {
   // 从当前目录读取 .env，注入终端审批与审计；只有 P04+ 才注册 Hook。
   // 当前目录是文件与命令的唯一工作区边界。
@@ -126,6 +131,7 @@ async function execute(profile: ChapterProfile, prompt: string): Promise<number>
   return 0;
 }
 
+// 创建仅记录生命周期的默认 Hook；它们不改变权限、参数、结果或停止决定。
 function liveHooks(): HookRegistry {
   // 默认 Hook 只观察生命周期，不改参数、结果或权限；stdout 留给最终答案。
   const hooks = new HookRegistry();
@@ -152,6 +158,7 @@ function liveHooks(): HookRegistry {
   return hooks;
 }
 
+// 从工具事件上下文提取可显示名称；缺失 prepared 表示 Hook 契约已被破坏。
 function hookToolName(context: HookContext): string {
   const definition = context.prepared?.definition;
   if (definition === undefined) {

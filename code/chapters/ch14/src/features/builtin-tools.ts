@@ -22,7 +22,9 @@ const backgroundShellInputSchema = z.strictObject({
 });
 
 export interface BackgroundShellInput {
+  // 交给 PowerShellRunner 的原始命令文本。
   readonly command: string;
+  // true/false 显式决定调度方式；null 或缺失时允许关键词启发式判断。
   readonly run_in_background?: boolean | null;
 }
 
@@ -46,6 +48,7 @@ export function createShellTool(
         return toolError("shell_start_failed", "PowerShell process could not be started");
       }
 
+      // 保留有限输出和超时状态，模型可据此决定是否调整命令。
       let output = result.output.length === 0 ? "(no output)" : result.output;
       if (result.truncated) {
         output = `${output}\n[output truncated]`;

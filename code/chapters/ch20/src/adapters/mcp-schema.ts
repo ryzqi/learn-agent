@@ -1,3 +1,4 @@
+// MCP JSON Schema 适配器：选择对应 Ajv dialect，并禁止远程 schema 通过外部引用加载额外资源。
 import { Ajv, type AnySchema } from "ajv";
 import { Ajv2019 } from "ajv/dist/2019.js";
 import { Ajv2020 } from "ajv/dist/2020.js";
@@ -14,10 +15,12 @@ export class AjvMcpSchemaValidator implements McpSchemaValidator {
     exposedName: string,
     inputSchema: Readonly<Record<string, unknown>>,
   ): (value: unknown) => boolean {
+    // 编译发生在工具发布阶段；返回谓词只报告通过/失败，Ajv 细节不进入模型上下文。
     try {
       if (inputSchema.type !== "object") {
         throw new McpContractError(`MCP tool input schema must have type object: ${exposedName}`);
       }
+      // 先 JSON 往返一次，排除循环引用、函数和不可序列化对象后再交给 Ajv。
       const serialized = JSON.stringify(inputSchema);
       if (serialized === undefined) {
         throw new McpContractError(

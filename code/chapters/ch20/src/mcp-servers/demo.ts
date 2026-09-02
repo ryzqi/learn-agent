@@ -1,8 +1,10 @@
+// 章节内置 MCP 测试服务：提供成功、业务失败、超时和进程终止四类确定性行为。
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
 const label = process.argv[process.argv.indexOf("--label") + 1];
+// label 区分两个同构 server，测试 alias 隔离时可从结果中确认实际路由目标。
 if (label === undefined || label.trim().length === 0) {
   throw new Error("--label must not be empty");
 }

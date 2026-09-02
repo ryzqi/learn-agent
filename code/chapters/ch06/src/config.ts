@@ -1,13 +1,16 @@
 // 模型配置：从环境变量映射或 .env 文件读取 OpenAI 兼容设置，并一次性校验缺失字段。
 import { readFileSync } from "node:fs";
 
+// 从环境变量或 .env 文件读取模型配置；一次性汇报全部缺失字段。
 import { parse } from "dotenv";
 
 // 从环境变量或 .env 文件读取模型配置；一次性汇报全部缺失字段。
 // 基础模型配置；后续章节可显式要求备用模型。
+// 从环境变量或 .env 文件读取模型配置；collectAllMissing 模式一次性汇报全部缺失字段。
 const requiredFields = ["OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"] as const;
 
 export class ConfigurationError extends Error {
+  // 配置错误携带全部缺失字段，CLI 进程边界据此返回退出码 2。
   override readonly name = "ConfigurationError";
   readonly missingFields: readonly string[];
 
@@ -28,6 +31,7 @@ export function settingsFromMapping(
   mapping: Readonly<Record<string, string | undefined>>,
   requireFallback = false,
 ): OpenAISettings {
+  // 先收集全部缺失字段，避免用户修复一个字段后才发现下一个字段。
   const fields = requireFallback ? [...requiredFields, "OPENAI_FALLBACK_MODEL"] : requiredFields;
   // 先收集全部缺失字段，避免用户修复一个字段后才发现下一个字段。
   const missing = fields.filter((field) => {
@@ -38,6 +42,7 @@ export function settingsFromMapping(
     throw new ConfigurationError(missing);
   }
 
+  // 字段已非空，但 baseUrl 还需要协议与路径校验，避免 SDK 拼出错误请求地址。
   const baseUrl = mapping.OPENAI_BASE_URL;
   const apiKey = mapping.OPENAI_API_KEY;
   const model = mapping.OPENAI_MODEL;
@@ -71,5 +76,6 @@ export function settingsFromMapping(
 }
 
 export function settingsFromEnvFile(path: string, requireFallback = false): OpenAISettings {
+  // .env 解析同样走 mapping 校验，离线测试可注入假文件或直接注入 mapping。
   return settingsFromMapping(parse(readFileSync(path)), requireFallback);
 }

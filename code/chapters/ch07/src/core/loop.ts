@@ -1,3 +1,4 @@
+// Agent 主循环：负责模型请求、工具准备、权限裁决、Hook 调度与历史配对校验。
 import { resolve } from "node:path";
 
 import { HookContractError, HookRegistry } from "./hooks.js";
@@ -42,6 +43,9 @@ export interface AgentRunnerOptions {
 
 export interface ToolRoundObserver {
   // 观察器可在模型请求前提供指导，并在工具轮完成后更新内部状态。
+  // 观察器接口由“请求前指导”和“工具轮后统计”两个时机构成：
+  // beforeModel 只影响当次请求，允许内部状态按需清零；recordToolRound
+  // 在整轮结果全部落盘后触发，保证统计永远基于完整、配对的工具轮。
   beforeModel(): readonly ChatMessage[];
   recordToolRound(toolNames: readonly string[]): void;
 }
@@ -53,6 +57,7 @@ interface ToolExecution {
 }
 
 export class AgentRunner {
+  // 构造函数做前置校验，不允许非法 maxTurns 或空 identity/systemPrompt。
   readonly #model: ModelClient;
   readonly #tools: ToolRegistry;
   readonly #systemPrompt: string;
@@ -97,6 +102,7 @@ export class AgentRunner {
   }
 
   async run(prompt: string): Promise<RunResult> {
+    // 先触发 UserPromptSubmit Hook，然后将 prompt 与 additionalContext 写入历史。
     const submitted = userMessage(prompt);
     const promptHook = await this.#hooks.runUserPrompt(submitted);
     this.#history.push(submitted, ...promptHook.additionalContext);
@@ -110,6 +116,8 @@ export class AgentRunner {
       validateToolPairing(this.#history);
       const tools = this.#tools.snapshot();
       // 观察器指导是请求级内容，只影响当次模型输入。
+      // beforeModel 可能在调用时有内部状态更新（如 TODO 提醒清零），
+      // 因此每个模型请求前只调用一次，不能放入 history 后再复用。
       const observerGuidance =
         // TODO 提醒是额外系统消息，不写入持久历史，避免重复累积。
         this.#toolRoundObserver === undefined ? [] : this.#toolRoundObserver.beforeModel();
@@ -175,6 +183,7 @@ export class AgentRunner {
         this.#history.push(toolMessage(result.content, call.id));
       }
       if (this.#toolRoundObserver !== undefined) {
+        // 等所有 tool result 都写入历史后再统计这一轮，确保观察器看不到半成品协议状态。
         this.#toolRoundObserver.recordToolRound(assistant.toolCalls.map((call) => call.name));
       }
       this.#history.push(...deferredContext);
@@ -190,6 +199,8 @@ export class AgentRunner {
     throw new AgentLimitError(`Agent exceeded maxTurns=${this.#maxTurns}`);
   }
 
+  // 每个回调优先检查 prepared 错误，然后依次执行 Pre Hook、权限裁决、handler 和 Post Hook。
+  // Hook 阻断、权限拒绝、Handler 错误都统一回填 tool_call_id，不会遗留未配对调用。
   async #executeTool(
     call: ToolCall,
     context: ToolContext,
@@ -263,6 +274,7 @@ export class AgentRunner {
   }
 
   #complete(finalText: string, turns: number): RunResult {
+    // 历史校验后返回冻结快照。
     validateToolPairing(this.#history);
     return Object.freeze({
       finalText,

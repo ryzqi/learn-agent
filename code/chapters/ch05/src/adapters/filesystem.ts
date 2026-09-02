@@ -1,3 +1,5 @@
+// Node.js 文件系统 adapter：将平台能力归一为 WorkspaceFileSystem 接口。
+// 路径安全通过 safePath 校验，拒绝绝对路径、盘符、上级目录和符号链接越界。
 import {
   lstat,
   mkdir,
@@ -36,6 +38,7 @@ function errorCode(error: unknown): string | undefined {
 // Node.js 文件系统 adapter：将平台能力归一为 WorkspaceFileSystem 接口。
 // 路径一律从工作区相对路径进入；错误统一归一为 core 可映射的领域错误。
 function translateFileSystemError(error: unknown): Error {
+  // Adapter 将平台 errno 收敛成 core 可稳定映射给模型的领域错误。
   if (
     error instanceof WorkspacePathError ||
     error instanceof TextNotFoundError ||
@@ -62,6 +65,7 @@ function translateFileSystemError(error: unknown): Error {
 
 // 所有路径以相对路径进入，先在词法层拒绝盘符、绝对路径和上级目录。
 function isInside(root: string, candidate: string): boolean {
+  // 相对路径为空表示 candidate 就是 root；其余必须以 .. 之外的非绝对子路径开头。
   const child = relative(root, candidate);
   return (
     child.length === 0 || (child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child))
@@ -69,6 +73,7 @@ function isInside(root: string, candidate: string): boolean {
 }
 
 function isWindowsReservedComponent(component: string): boolean {
+  // 尾部空格/点、控制字符和 Windows 路径特殊字符都不允许出现在普通文件组件中。
   if (component.endsWith(" ") || component.endsWith(".")) {
     return true;
   }
@@ -95,6 +100,7 @@ function isWindowsReservedComponent(component: string): boolean {
 }
 
 function relativeParts(value: string, label: string, allowWildcards: boolean): string[] {
+  // 所有路径以相对路径进入，先在词法层拒绝盘符、绝对路径和上级目录。
   if (value.length === 0) {
     throw new WorkspacePathError(`${label} must not be empty`);
   }
@@ -133,6 +139,7 @@ function relativeParts(value: string, label: string, allowWildcards: boolean): s
 }
 
 async function workspaceRoot(workspace: string): Promise<string> {
+  // realpath 先解析工作区自身，后续 safePath 都基于真实根目录计算边界。
   const root = await realpath(workspace);
   const information = await stat(root);
   if (!information.isDirectory()) {
@@ -145,6 +152,7 @@ async function resolvedExistingParent(
   root: string,
   target: string,
 ): Promise<{ physical: string; lexical: string }> {
+  // 从目标逐级向上找已存在父路径，真实解析后再拼接不存在的尾部，防止符号链接逃逸。
   let current = target;
   while (true) {
     try {
@@ -161,6 +169,7 @@ async function resolvedExistingParent(
 export async function safePath(workspace: string, relativePath: string): Promise<string> {
   try {
     const root = await workspaceRoot(workspace);
+    // 先做词法检查，拒绝绝对路径、..、Windows 保留名和非法字符。
     const parts = relativeParts(relativePath, "path", false);
     const target = resolve(root, ...parts);
     if (!isInside(root, target)) {
@@ -199,6 +208,7 @@ function splitLines(text: string): string[] {
 
 // 仅实现工具契约需要的 *, **, ? 和字符类，不将未验证模式交给 Shell。
 function globRegex(pattern: string): RegExp {
+  // 仅实现工具契约需要的 *, **, ? 和字符类，不将未验证模式交给 Shell。
   let source = "^";
   for (let index = 0; index < pattern.length; index += 1) {
     const character = pattern[index];
@@ -269,6 +279,7 @@ export class NodeWorkspaceFileSystem implements WorkspaceFileSystem {
       const text = decodeUtf8(await readFileBytes(target), relativePath);
       const lines = splitLines(text);
       if (limit !== undefined && limit < lines.length) {
+        // 截断提示保留总行数，调用方可决定是否继续读取。
         return [...lines.slice(0, limit), `... (${lines.length - limit} more lines)`].join("\n");
       }
       return lines.join("\n");
@@ -306,6 +317,7 @@ export class NodeWorkspaceFileSystem implements WorkspaceFileSystem {
       if (index === -1) {
         throw new TextNotFoundError(`Exact text not found in ${relativePath}`);
       }
+      // 只替换首次精确匹配，避免模型提出的编辑意外影响多个位置。
       const updated = `${current.slice(0, index)}${newText}${current.slice(index + oldText.length)}`;
       await writeFileBytes(target, Buffer.from(updated, "utf8"));
     } catch (error) {

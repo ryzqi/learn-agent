@@ -1,3 +1,5 @@
+// Hook 生命周期：把用户提交、工具调用前后和停止事件归一为 HookContext/HookResult，并合并多个订阅者的权限建议。
+// Hook 生命周期：按事件注册回调，串行合并结果并强制结构化副作用。
 import type { ChatMessage } from "./messages.js";
 import { isChatMessage, systemMessage, userMessage } from "./messages.js";
 import type { PermissionBehavior } from "./permissions.js";
@@ -5,6 +7,8 @@ import { isPermissionBehavior } from "./permissions.js";
 import type { PreparedToolCall, ToolResult } from "./tools.js";
 import { copyToolResult, freezePreparedToolCall, isToolResult } from "./tools.js";
 
+// Hook 是受限扩展点，只允许这四类生命周期事件，避免插件绕过 Agent 核心流程。
+// 支持的生命周期事件集合；注册表和运行期校验共用它避免事件名漂移。
 export const HOOK_EVENTS = Object.freeze([
   "UserPromptSubmit",
   "PreToolUse",
@@ -15,13 +19,16 @@ export const HOOK_EVENTS = Object.freeze([
 export type HookEvent = (typeof HOOK_EVENTS)[number];
 
 export class HookContractError extends Error {
+  // 稳定错误名，表明 Hook 输入、输出或事件字段违反受限扩展契约。
   override readonly name: string = "HookContractError";
 }
 
+// 收窄未知事件值，构造 HookContext 和注册回调前均需经过此边界。
 function isHookEvent(value: unknown): value is HookEvent {
   return HOOK_EVENTS.some((event) => event === value);
 }
 
+// 确认 Hook 接收到的是已通过工具名称和 schema 校验的调用，拒绝不完整 prepare 结果。
 function isValidPrepared(prepared: unknown): prepared is PreparedToolCall {
   if (typeof prepared !== "object" || prepared === null) {
     return false;
@@ -48,14 +55,21 @@ function isValidPrepared(prepared: unknown): prepared is PreparedToolCall {
 }
 
 export interface HookContextOptions {
+  // 决定允许哪些字段的生命周期事件。
   readonly event: HookEvent;
+  // UserPromptSubmit 专属的用户消息。
   readonly message?: ChatMessage;
+  // PreToolUse/PostToolUse 专属的已准备调用。
   readonly prepared?: PreparedToolCall;
+  // PostToolUse 专属的工具结果。
   readonly result?: ToolResult;
+  // Stop 专属的当前会话历史快照。
   readonly history?: readonly ChatMessage[];
+  // Stop 是否已经请求过继续，用于阻止 Hook 自我延续。
   readonly stopHookActive?: boolean;
 }
 
+// 某次 Hook 回调看到的冻结生命周期数据；不同事件严格隔离字段所有权。
 export class HookContext {
   // 每个事件只携带其拥有的数据，避免 Hook 误用其他生命周期阶段的状态。
   readonly event: HookEvent;
@@ -65,6 +79,7 @@ export class HookContext {
   readonly history: readonly ChatMessage[];
   readonly stopHookActive: boolean;
 
+  // 校验事件字段组合、复制 history 并冻结上下文，防止回调修改 Agent 内部状态。
   constructor(options: HookContextOptions) {
     if (!isHookEvent(options.event)) {
       throw new HookContractError("event must be a HookEvent");
@@ -88,6 +103,7 @@ export class HookContext {
     Object.freeze(this);
   }
 
+  // 按事件验证字段归属，避免例如 Stop Hook 读取或伪造工具执行状态。
   #validateEventFields(): void {
     if (this.event === "UserPromptSubmit") {
       if (!isChatMessage(this.message) || this.message.role !== "user") {
@@ -136,17 +152,26 @@ export class HookContext {
 }
 
 export interface HookResultOptions {
+  // PreToolUse 对权限合并提出的候选行为。
   readonly permissionBehavior?: PermissionBehavior;
+  // PreToolUse 唯一允许的参数更新，必须保留原调用身份与定义。
   readonly updatedInput?: PreparedToolCall;
+  // PostToolUse 唯一允许的结果更新。
   readonly updatedOutput?: ToolResult;
+  // 任意事件可追加的只读系统上下文，下一轮模型请求前置。
   readonly additionalContext?: readonly ChatMessage[];
+  // PreToolUse 可阻断执行并直接回填的错误结果。
   readonly blockingError?: ToolResult;
+  // PostToolUse 请求停止剩余同轮调用与后续继续。
   readonly preventContinuation?: boolean;
+  // Stop 请求额外一次模型轮次的用户消息，只允许生效一次。
   readonly forceContinue?: ChatMessage;
 }
 
+// Hook 的结构化影响；回调不能直接改写 Loop，只能返回受事件约束的声明式结果。
 export class HookResult {
   // Hook 的副作用被建模为结构化结果，不能直接修改 Agent 内部状态。
+  // 构造器内校验类型并冻结副本，防止回调引用扩散污染。
   readonly permissionBehavior: PermissionBehavior;
   readonly updatedInput: PreparedToolCall | undefined;
   readonly updatedOutput: ToolResult | undefined;
@@ -155,6 +180,7 @@ export class HookResult {
   readonly preventContinuation: boolean;
   readonly forceContinue: ChatMessage | undefined;
 
+  // 验证结果形状、深复制可变引用并冻结，防止回调返回值在合并后被改写。
   constructor(options: HookResultOptions = {}) {
     const permissionBehavior = options.permissionBehavior ?? "passthrough";
     const additionalContext = options.additionalContext ?? [];
@@ -207,6 +233,8 @@ export class HookResult {
     Object.freeze(this);
   }
 
+  // 结果字段按事件过滤，防止 PreToolUse 的变更被误用到 Stop。
+  // 检查当前结果是否只使用目标事件允许的字段，避免跨生命周期越权。
   validateFor(event: HookEvent): void {
     if (!isHookEvent(event)) {
       throw new HookContractError("event must be a HookEvent");
@@ -242,14 +270,18 @@ export class HookResult {
   }
 }
 
+// 同步或异步 Hook 回调；必须返回受 HookResult 契约约束的对象。
 export type HookCallback = (context: HookContext) => HookResult | Promise<HookResult>;
 
+// 按事件保存有序回调队列，并负责串行运行、标准化和合并各回调结果。
 export class HookRegistry {
   // 回调按注册顺序合并；后续回调读取前一个回调规范化后的上下文。
+  // 每个事件有独立回调队列，注册顺序即为执行顺序。
   readonly #callbacks: Map<HookEvent, HookCallback[]> = new Map(
     HOOK_EVENTS.map((event) => [event, []]),
   );
 
+  // 注册回调到事件队列尾部，注册顺序即该事件的执行顺序。
   register(event: HookEvent, callback: HookCallback): void {
     if (!isHookEvent(event)) {
       throw new HookContractError("event must be a HookEvent");
@@ -264,7 +296,10 @@ export class HookRegistry {
     callbacks.push(callback);
   }
 
+  // 按注册顺序合并回调；后续回调读取更新后的上下文，blockingError/forceContinue 终止继续执行。
+  // 串行执行该事件所有回调，传递规范化后的上下文并合并成单个最终结果。
   async run(context: HookContext): Promise<HookResult> {
+    // 串行执行回调，合并结果；blockingError 或 forceContinue 短路。
     if (!(context instanceof HookContext)) {
       throw new HookContractError("context must be a HookContext");
     }
@@ -317,24 +352,31 @@ export class HookRegistry {
     return combined;
   }
 
+  // 以用户消息构造 UserPromptSubmit 上下文并运行对应队列。
   async runUserPrompt(message: ChatMessage): Promise<HookResult> {
     return this.run(new HookContext({ event: "UserPromptSubmit", message }));
   }
 
+  // 以已验证调用构造 PreToolUse 上下文。
   async runPreTool(prepared: PreparedToolCall): Promise<HookResult> {
     return this.run(new HookContext({ event: "PreToolUse", prepared }));
   }
 
+  // 以调用与结果构造 PostToolUse 上下文。
   async runPostTool(prepared: PreparedToolCall, result: ToolResult): Promise<HookResult> {
     return this.run(new HookContext({ event: "PostToolUse", prepared, result }));
   }
 
+  // 以历史与续写状态构造 Stop 上下文，Stop 只能安全请求一次继续。
   async runStop(history: readonly ChatMessage[], stopHookActive: boolean): Promise<HookResult> {
     return this.run(new HookContext({ event: "Stop", history, stopHookActive }));
   }
 }
 
+// Hook 只能修改 arguments，不能换工具或换调用 id；更新后的参数必须重新过 schema。
+// 重解析 Hook 提供的参数更新，保留原调用 ID/工具定义并返回脱离 Hook 引用的冻结副本。
 function normalizeUpdatedInput(
+  // 重新解析 updatedInput 并冻结副本，防止“批准 A、执行 B”。
   context: HookContext,
   result: HookResult,
 ): PreparedToolCall | undefined {
@@ -363,7 +405,12 @@ function normalizeUpdatedInput(
   return freezePreparedToolCall(updated.call, original.definition, parsed.data);
 }
 
+// 多个 Hook 的结果按结构合并：permission 取更强，附加上下文按顺序累积。
+// 合并串行回调影响：更新以后者为准、上下文累积、权限取最严格、阻断/续写短路保留首项。
 function mergeResults(current: HookResult, incoming: HookResult): HookResult {
+  // 合并策略：updatedInput/Output 以后优先，additionalContext 串联，
+  // preventContinuation OR，permissionBehavior 取最严格，
+  // blockingError/forceContinue 短路并保留最先出现的。
   return new HookResult({
     permissionBehavior: strongerPermission(current.permissionBehavior, incoming.permissionBehavior),
     ...(incoming.updatedInput === undefined
@@ -391,7 +438,10 @@ function mergeResults(current: HookResult, incoming: HookResult): HookResult {
   });
 }
 
+// 权限强度固定为 passthrough < allow < ask < deny，任何一方都不能降低既有拒绝强度。
+// 按 deny > ask > allow > passthrough 的保守优先级合并权限建议。
 function strongerPermission(
+  // deny > ask > allow > passthrough
   current: PermissionBehavior,
   incoming: PermissionBehavior,
 ): PermissionBehavior {

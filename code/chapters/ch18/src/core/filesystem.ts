@@ -50,6 +50,8 @@ export interface WorkspaceWriteBoundary {
 }
 
 // 仅声明 Agent 工具需要的工作区文件能力。
+// SkillRegistry 复用本文件的保留组件检查，但 SKILL.md 扫描不走此 adapter：
+// 它需要控制 frontmatter 的逐字节读取，并在加载时异步重查真实路径。
 export interface WorkspaceFileSystem extends WorkspaceWriteBoundary {
   readFile(workspace: string, relativePath: string, limit?: number): Promise<string>;
   writeFile(workspace: string, relativePath: string, content: string): Promise<number>;

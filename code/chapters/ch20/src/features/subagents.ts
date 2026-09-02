@@ -1,3 +1,5 @@
+// 一次性子代理：通过 task 工具创建隔离 AgentRunner，只回传最终结论，并禁止子代理递归注册 task。
+// 第 6 章新增子代理能力：task 工具把自包含任务委派给隔离的 AgentRunner。
 import { z } from "zod";
 
 import { HookRegistry } from "../core/hooks.js";
@@ -9,7 +11,9 @@ import type { ToolContext, ToolDefinition, ToolResult } from "../core/tools.js";
 import { ToolRegistry, toolError, toolSuccess } from "../core/tools.js";
 
 export const TASK_TOOL_NAME = "task";
+// 默认 30 轮上限：子代理只做有限委派，避免同步调用拖住父循环。
 export const DEFAULT_SUBAGENT_MAX_TURNS = 30;
+// 子代理的固定职责提示；明确单任务和禁止继续委派的运行边界。
 export const DEFAULT_SUBAGENT_SYSTEM_PROMPT =
   "You are a focused coding subagent working in the current workspace. " +
   "Complete only the delegated task, then return a concise, evidence-based final conclusion. " +
@@ -26,21 +30,29 @@ const taskInputSchema = z
   })
   .strict();
 
+// 已清洗的委派描述；父 Agent 只允许把这一个字段交给子运行器。
 export type TaskInput = Readonly<z.output<typeof taskInputSchema>>;
+// 每次 task 调用都应创建独立模型，避免子任务间复用上下文或响应队列。
 export type ModelClientFactory = () => ModelClient;
+// 每次 task 调用都应创建独立工具注册表，防止子任务残留工具状态。
 export type ToolRegistryFactory = () => ToolRegistry;
 
 // 工厂签名允许调用方为每次委派延迟创建独立的模型与工具实例。
 export interface SubagentToolOptions {
+  // 用工厂而非实例保证每个子任务拥有自己的模型与注册表。
   readonly modelFactory: ModelClientFactory;
   readonly toolsFactory: ToolRegistryFactory;
+  // Hook 与策略作为受控边界共享，使子代理不能绕开父级治理。
   readonly hooks: HookRegistry;
   readonly permissionPolicy: PermissionPolicy;
   readonly toolContextProvider?: ToolContextProvider;
+  // 可覆盖子代理职责提示，但不能传入空提示。
   readonly systemPrompt?: string;
+  // 仅允许收紧默认上限，避免调用方放大单次委派成本。
   readonly maxTurns?: number;
 }
 
+// task 是父 Agent 可调用的外部工具，负责建立并封装一次隔离的子执行。
 export class SubagentTool {
   readonly #modelFactory: ModelClientFactory;
   readonly #toolsFactory: ToolRegistryFactory;
@@ -101,7 +113,9 @@ export class SubagentTool {
     });
   }
 
+  // 将已验证描述交给新运行器；所有内部异常在此转换为可安全回传的工具错误。
   async #runTask(input: TaskInput, context: ToolContext): Promise<ToolResult> {
+    // 子代理在独立 AgentRunner 中执行；父级历史、TODO 状态和工具结果不会回流。
     try {
       // 工厂在每次委派时创建隔离依赖，父代理的工具状态不会被子代理共享或改写。
       const tools: unknown = this.#toolsFactory();
@@ -160,6 +174,7 @@ export class SubagentTool {
   }
 }
 
+// 以最小运行时形状验证工厂结果，防止错误配置到达 AgentRunner 后才产生不明确异常。
 function isModelClient(value: unknown): value is ModelClient {
   return (
     typeof value === "object" &&

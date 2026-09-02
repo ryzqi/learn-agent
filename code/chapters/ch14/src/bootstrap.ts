@@ -13,7 +13,11 @@ import type { ChapterProfile } from "./core/profiles.js";
 import { profileForChapter } from "./core/profiles.js";
 import type { ToolRegistry } from "./core/tools.js";
 import { createChapterOneTools, createChapterTwoTools } from "./features/builtin-tools.js";
-import { BackgroundDispatcher, type JobSupervisor } from "./features/background.js";
+import {
+  BackgroundDispatcher,
+  registerBackgroundJobTools,
+  type JobSupervisor,
+} from "./features/background.js";
 import type { CronRuntime } from "./features/cron.js";
 import { CompactionManager, ModelHistorySummarizer } from "./features/compaction.js";
 import { MemorySession, MemoryStore, ModelMemoryQueries } from "./features/memory.js";
@@ -187,6 +191,10 @@ export function buildAgent(profile: ChapterProfile, dependencies: BuildDependenc
   if (dependencies.taskStore !== undefined) {
     // 主 Agent 直接注册持久任务工具，与子 Agent 使用同一个 TaskStore。
     registerTaskTools(tools, dependencies.taskStore);
+  }
+  if (dependencies.backgroundSupervisor !== undefined) {
+    // 主 Agent 注册后台查询与取消工具；子 Agent 不接收后台 Supervisor，因此不暴露这些能力。
+    registerBackgroundJobTools(tools, dependencies.backgroundSupervisor);
   }
   if (dependencies.cronRuntime !== undefined) {
     // P14 注册 schedule_cron，调度事件经同一 Supervisor/Inbox 回注 Loop。

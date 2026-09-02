@@ -17,17 +17,28 @@ import { copyToolResult, isToolResult, toolSuccess } from "../core/tools.js";
 import type { ToolResult } from "../core/tools.js";
 
 // 默认预算均按 UTF-8 byte 计算；集中为常量便于测试注入小预算。
+// 单个工具结果超过此 UTF-8 字节数时优先落盘并只回填引用预览。
 export const DEFAULT_PERSIST_THRESHOLD_BYTES = 30_000;
+// 同一轮结果允许留在上下文中的总预算，超出部分按大小优先持久化。
 export const DEFAULT_BATCH_BUDGET_BYTES = 200_000;
+// 工具结果引用保留的头部预览字节数。
 export const DEFAULT_PREVIEW_HEAD_BYTES = 2_000;
+// 工具结果引用保留的尾部预览字节数。
 export const DEFAULT_PREVIEW_TAIL_BYTES = 2_000;
+// 微压缩时保留的最近完整工具交换组数量。
 export const DEFAULT_KEEP_RECENT_TOOL_GROUPS = 3;
+// prompt-too-long 响应式压缩后保留的最近消息组数量。
 export const DEFAULT_REACTIVE_TAIL_GROUPS = 5;
+// 请求历史超过此预算时，在模型调用前主动生成摘要。
 export const DEFAULT_PROACTIVE_THRESHOLD_BYTES = 50_000;
+// snip 压缩允许保留的最大消息组数。
 export const DEFAULT_SNIP_MAX_GROUPS = 50;
+// snip 压缩保留的最早消息组数，用于保留任务开端上下文。
 export const DEFAULT_SNIP_KEEP_HEAD_GROUPS = 3;
 export const COMPACTED_TOOL_RESULT = "[Earlier tool result compacted. Re-run if needed.]";
 
+// 默认阈值均按 UTF-8 byte 计算；集中为常量便于测试注入小预算。
+// 默认预算统一放在模块顶部：字节阈值按 UTF-8 byte，组数按完整消息组；测试可注入小值。
 const SUMMARY_SYSTEM_PROMPT = `请将当前 Agent 历史压缩为一个 JSON object。
 只能返回 JSON，不得调用工具。JSON 必须且只能包含：
 current_goal: 非空字符串；
@@ -39,23 +50,28 @@ const ARTIFACT_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const MAX_ARTIFACT_ID_LENGTH = 96;
 
 // 压缩层把超长结果移出模型上下文，但保留可追溯的 workspace artifact 引用。
+// 压缩领域错误的公共基类，调用方按子类决定是拒绝、清理还是重试。
 export class CompactionError extends Error {
   override readonly name: string = "CompactionError";
 }
 
+// artifact 路径或目录不满足安全边界，例如 ID 非法、符号链接逃逸。
 export class ArtifactPathError extends CompactionError {
   override readonly name: string = "ArtifactPathError";
 }
 
+// 目标 artifact 已存在；独占发布失败时不覆盖旧文件。
 export class ArtifactConflictError extends CompactionError {
   override readonly name: string = "ArtifactConflictError";
 }
 
+// 同一恢复窗口内已经尝试过 prompt-too-long 压缩，禁止再次压缩。
 export class PromptTooLongRetryError extends CompactionError {
   override readonly name: string = "PromptTooLongRetryError";
 }
 
 export interface CompactionSummaryOptions {
+  // 当前目标、事实、文件、剩余工作和约束共同构成可恢复的最小摘要。
   readonly currentGoal: string;
   readonly keyFindings: readonly string[];
   readonly filesReadOrChanged: readonly string[];
@@ -82,10 +98,12 @@ export class CompactionSummary {
 }
 
 export interface HistorySummarizer {
+  // 摘要器只读消息快照；不得修改 canonical history 或调用工具。
   summarize(history: readonly ChatMessage[], signal?: AbortSignal): Promise<CompactionSummary>;
 }
 
 // 摘要请求没有工具，且只接受 stop + 严格 JSON，避免压缩流程引入新的副作用。
+// 使用主模型完成摘要：请求不含工具，输出必须是严格 JSON，避免摘要层产生副作用。
 export class ModelHistorySummarizer implements HistorySummarizer {
   readonly #model: ModelClient;
 
@@ -102,6 +120,8 @@ export class ModelHistorySummarizer implements HistorySummarizer {
   ): Promise<CompactionSummary> {
     const { snapshot } = validatedGroups(history);
     // 摘要请求没有工具且必须 stop；任何工具调用或截断都会让压缩失败。
+    // 摘要请求把历史附加在固定 system prompt 之后，且不携带工具定义。
+    // 模型输出工具调用、被截断或返回空内容都视为压缩失败，不能让坏摘要进入请求历史。
     const reply = await this.#model.complete(
       Object.freeze({
         messages: Object.freeze([systemMessage(SUMMARY_SYSTEM_PROMPT), ...snapshot]),
@@ -126,8 +146,11 @@ export class ModelHistorySummarizer implements HistorySummarizer {
 }
 
 export interface ArtifactReference {
+  // 工件的绝对路径，仅供本地清理；模型使用 relativePath。
   readonly path: string;
+  // 相对工作区路径，可安全写入工具结果和摘要。
   readonly relativePath: string;
+  // 落盘前正文的 UTF-8 字节数，帮助模型判断是否需要重新读取。
   readonly originalBytes: number;
 }
 
@@ -137,22 +160,28 @@ export interface ToolResultArtifact {
 }
 
 export interface ToolResultBudgetOutcome {
+  // 与输入结果一一对应的替换快照，保证 tool_call 配对关系不变。
   readonly results: readonly ToolResult[];
   readonly artifacts: readonly ToolResultArtifact[];
 }
 
 export interface HistoryCompactionOutcome {
+  // 下一次模型请求使用的摘要加尾部消息快照。
   readonly history: readonly ChatMessage[];
+  // canonical transcript 的持久化引用，失败恢复时仍可定位完整历史。
   readonly transcript: ArtifactReference;
 }
 
+// 消息组是压缩的最小单位：普通消息单独成组，assistant 工具调用与其全部结果成一组。
 interface MessageGroup {
   readonly messages: readonly ChatMessage[];
   readonly isToolExchange: boolean;
 }
 
 export interface CompactionManagerOptions {
+  // 所有 artifact 必须落在此工作区下，路径边界在构造时解析。
   readonly workspace: string;
+  // 生成结构化摘要的模型边界；摘要请求禁用工具。
   readonly summarizer: HistorySummarizer;
   readonly idGenerator?: () => string;
   readonly persistThresholdBytes?: number;
@@ -180,10 +209,13 @@ export class CompactionManager {
   readonly #snipMaxGroups: number;
   readonly #snipKeepHeadGroups: number;
   readonly #keepRecentToolGroups: number;
+  // prepare 的缓存仅针对最近 canonical 快照；canonical history 始终由调用方持有。
   #preparedSource: readonly ChatMessage[] | undefined;
+  // 与 #preparedSource 对应的请求级压缩结果，可在纯追加时增量复用。
   #preparedHistory: readonly ChatMessage[] | undefined;
 
   constructor(options: CompactionManagerOptions) {
+    // 构造期统一解析默认值和校验参数，后续 prepare/compact 不再重复解释配置。
     const persistThresholdBytes = optionValue(
       options.persistThresholdBytes,
       DEFAULT_PERSIST_THRESHOLD_BYTES,
@@ -247,6 +279,8 @@ export class CompactionManager {
   async prepare(history: readonly ChatMessage[]): Promise<readonly ChatMessage[]> {
     const { snapshot } = validatedGroups(history);
     // 相同 canonical 快照直接复用上次请求历史；纯追加时只压缩新增后缀。
+    // 请求级压缩入口：先从 canonical history 取不可变快照，再按 snip -> micro -> summary
+    // 顺序准备下一次模型输入。canonical history 本身永远不会被这个函数改写。
     const cachedSource = this.#preparedSource;
     const cachedHistory = this.#preparedHistory;
     if (
@@ -286,6 +320,8 @@ export class CompactionManager {
   }
 
   async compactToolResults(results: readonly ToolResult[]): Promise<ToolResultBudgetOutcome> {
+    // 工具结果处理器：在整轮 ToolResult 回填 canonical history 前完成落盘。
+    // 接收的是同一轮全部结果，因此可以按总预算做“最大优先”批次选择，而不是逐条独立判断。
     if (!Array.isArray(results) || !results.every((result: unknown) => isToolResult(result))) {
       throw new TypeError("results must contain only ToolResult values");
     }
@@ -329,6 +365,7 @@ export class CompactionManager {
     const artifacts: ToolResultArtifact[] = [];
     try {
       // 先完成整批落盘，任一失败都由下面的 cleanup 撤销本次已发布文件。
+      // 整批先落盘，任一失败都由 cleanup 撤销本次已发布文件。
       for (const index of ranked) {
         if (!selected.has(index)) {
           continue;
@@ -368,6 +405,7 @@ export class CompactionManager {
     history: readonly ChatMessage[],
     signal?: AbortSignal,
   ): Promise<HistoryCompactionOutcome> {
+    // 显式压缩 API 不经过 snip/micro，直接保存完整 transcript 并生成结构化摘要。
     const { snapshot } = validatedGroups(history);
     return this.#compactValidated(snapshot, snapshot, 0, signal, false);
   }
@@ -378,6 +416,8 @@ export class CompactionManager {
     signal?: AbortSignal,
   ): Promise<HistoryCompactionOutcome> {
     // 响应式压缩只在同一逻辑请求中允许一次；retryCount 形成递归保护。
+    // 响应式恢复原语：调用者已经确认输入上下文过长，本方法只允许当前窗口压缩一次。
+    // 摘要后保留最近完整组，让模型仍有最新进展可看，而不是只剩一条压缩摘要。
     requireNonNegativeInteger("retryCount", options.retryCount);
     if (options.retryCount > 0) {
       throw new PromptTooLongRetryError("prompt-too-long compaction was already attempted");
@@ -394,6 +434,9 @@ export class CompactionManager {
     cleanupOnFailure: boolean,
   ): Promise<HistoryCompactionOutcome> {
     // transcript 先落盘；响应式模式在取消或摘要失败时清理已发布 artifact。
+    // 先保存完整 transcript；摘要失败时也不丢失进入压缩前的会话快照。
+    // transcript 与摘要使用不同历史来源：transcript 永远来自完整 canonical 快照，
+    // 摘要只读便宜层处理后的 request history。先保存 transcript，摘要失败时也能保留现场。
     const transcript = await this.#writeArtifact(
       "transcript",
       ".jsonl",
@@ -428,6 +471,7 @@ export class CompactionManager {
     content: Buffer,
   ): Promise<ArtifactReference> {
     // artifact ID 受 slug 约束，最终路径只落在 workspace 的固定 artifacts 目录。
+    // 统一写入入口：校验 ID slug，创建安全目录，再用独占发布生成最终文件。
     const artifactId: unknown = this.#idGenerator();
     if (
       typeof artifactId !== "string" ||
@@ -545,6 +589,7 @@ export function snipCompactHistory(
 }
 
 export function historyUtf8Bytes(history: readonly ChatMessage[]): number {
+  // 预算判断与 transcript 共用同一份规范化 JSONL，避免两种序列化产生不同字节数。
   const { snapshot } = validatedGroups(history);
   return serializeTranscript(snapshot).byteLength;
 }
@@ -602,6 +647,7 @@ function serializeTranscript(history: readonly ChatMessage[]): Buffer {
 }
 
 function toOpenAIMessage(message: ChatMessage): Readonly<Record<string, unknown>> {
+  // 内部 ChatMessage 转 OpenAI wire shape；只保留协议需要的字段，并保留 tool_call_id。
   if (message.role === "system" || message.role === "user") {
     return { role: message.role, content: message.content };
   }
@@ -641,6 +687,8 @@ function sortJson(value: unknown): unknown {
 }
 
 function summaryMessage(summary: CompactionSummary, transcriptPath: string): ChatMessage {
+  // 摘要消息是 system role，包含 kind、transcript_path 和五类继续工作信息；
+  // 模型下一轮可以直接读取这些字段，不需要重新翻阅被压缩的历史。
   return systemMessage(
     stableStringify({
       kind: "compacted_history",
@@ -711,6 +759,7 @@ function boundedUtf8Preview(
   headLimit: number,
   tailLimit: number,
 ): readonly [string, string] {
+  // 先按 byte 截取头部和尾部，再用 TextDecoder 丢弃边界上的不完整 UTF-8 字符。
   const headEnd = Math.min(content.byteLength, headLimit);
   const tailStart = Math.max(headEnd, content.byteLength - tailLimit);
   return Object.freeze([
@@ -736,6 +785,7 @@ function decodeUtf8Boundary(content: Buffer, boundary: "head" | "tail"): string 
 }
 
 async function ensureArtifactDirectory(workspace: string): Promise<string> {
+  // 固定产物根目录，并逐层验证真实路径，避免 .agent_tutorial/artifacts 被链接替换。
   const stateDirectory = join(workspace, ".agent_tutorial");
   await ensureSafeDirectory(stateDirectory, workspace);
   const artifactDirectory = join(stateDirectory, "artifacts");
@@ -838,6 +888,7 @@ function resolveWorkspace(workspace: string): string {
 }
 
 function isWithinWorkspace(workspace: string, candidate: string): boolean {
+  // 用相对路径判断包含关系，避免字符串前缀误判 C:\a 与 C:\ab。
   const offset = relative(workspace, candidate);
   return (
     offset === "" || (!offset.startsWith(`..${sep}`) && offset !== ".." && !isAbsolute(offset))
@@ -866,6 +917,7 @@ function historyStartsWith(
 }
 
 function optionValue(value: number | undefined, fallback: number): number {
+  // 配置项未显式传入时使用模块默认值；显式传入的非法值继续走 require 校验。
   return value === undefined ? fallback : value;
 }
 
@@ -876,6 +928,7 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 }
 
 function requireNonEmptyText(name: string, value: unknown): string {
+  // 摘要字段拒绝空字符串，避免模型用占位符掩盖缺失信息。
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new TypeError(`${name} must be a non-empty string`);
   }
@@ -883,6 +936,7 @@ function requireNonEmptyText(name: string, value: unknown): string {
 }
 
 function requireTextArray(name: string, value: readonly string[]): readonly string[] {
+  // 字符串数组中的每一项都必须非空，冻结后作为不可变摘要状态。
   if (
     !Array.isArray(value) ||
     !value.every((item: unknown) => typeof item === "string" && item.trim().length > 0)
@@ -893,18 +947,21 @@ function requireTextArray(name: string, value: readonly string[]): readonly stri
 }
 
 function requirePositiveInteger(name: string, value: number): void {
+  // 预算必须为正整数，防止 0 或小数造成无意义的阈值。
   if (!Number.isInteger(value) || value <= 0) {
     throw new RangeError(`${name} must be a positive integer`);
   }
 }
 
 function requireNonNegativeInteger(name: string, value: number): void {
+  // 允许 0 的配置（例如预览字节或保留组数）也必须仍是整数。
   if (!Number.isInteger(value) || value < 0) {
     throw new RangeError(`${name} must be a non-negative integer`);
   }
 }
 
 function validateSnipConfiguration(maxGroups: number, keepHeadGroups: number): void {
+  // snip 需要至少容纳 head、marker 和 tail 三部分，避免切出空历史。
   requirePositiveInteger("maxGroups", maxGroups);
   requirePositiveInteger("keepHeadGroups", keepHeadGroups);
   if (maxGroups < 3) {
@@ -916,5 +973,6 @@ function validateSnipConfiguration(maxGroups: number, keepHeadGroups: number): v
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  // 只把带 code 字段的 Error 当作 Node 系统错误，用于识别 EEXIST 等写入结果。
   return error instanceof Error && "code" in error;
 }

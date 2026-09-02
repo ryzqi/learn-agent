@@ -1,3 +1,4 @@
+// TODO 会话计划：用完整快照工具 todo_write 管理模型可见任务列表，并在计划长期未更新时向下一轮模型请求注入提醒。
 import { z } from "zod";
 
 import type { ChatMessage } from "../core/messages.js";
@@ -6,9 +7,13 @@ import type { ToolDefinition, ToolResult } from "../core/tools.js";
 import { toolSuccess } from "../core/tools.js";
 
 // 单次计划快照的数量上限，防止模型一次性塞入超大数组。
+// 会话级 TODO capability：用完整计划快照对抗长上下文中的任务遗忘。
+// 边界：状态只存在于单次 AgentRunner 生命周期，不做跨会话或磁盘持久化；
+// 提醒只注入下一次模型请求，不写入正式消息历史。
 export const MAX_TODOS = 50;
 // 连续未更新计划的其他工具轮次数，达到后会在下一次模型请求前提醒。
 export const STALE_TOOL_ROUNDS = 3;
+// 注入的提醒保持固定文案，测试和模型上下文都能观察到同一契约。
 export const TODO_STALE_REMINDER =
   "Keep the TODO list current. Call todo_write with the complete task snapshot when the plan changes.";
 // 三个合法状态作为工具 schema 的唯一取值来源。
@@ -34,16 +39,22 @@ const todoWriteSchema = z
   })
   .strict();
 
+// 已校验且冻结的计划项，tracker 只保存这种内部安全形态。
 export type TodoItem = Readonly<z.output<typeof todoItemSchema>>;
+// 工具 handler 的内部入参；只在 schema 校验成功后才会进入写入路径。
 type TodoWriteInput = z.output<typeof todoWriteSchema>;
 
 // TodoTracker 是会话级状态：每次构建 Agent 都新建实例，避免跨会话共享计划。
 export class TodoTracker {
   // 观察每轮工具调用；计划长期未更新时，在下次模型请求前注入提醒。
+  // 当前完整计划快照；替换而非原地修改，使工具输出与内存状态一一对应。
   #todos: readonly TodoItem[] = Object.freeze([]);
+  // 自上次写计划以来发生的非 TODO 工具轮数，不统计没有工具调用的模型回复。
   #nonTodoToolRounds = 0;
+  // 暴露给 ToolRegistry 的唯一写入口，handler 闭包保证不会写入其他 tracker 实例。
   readonly toolDefinition: ToolDefinition<TodoWriteInput>;
 
+  // 每个 AgentRunner 独立构造 tracker，避免不同用户或工作区共享任务计划。
   constructor() {
     // toolDefinition 与当前 tracker 绑定，作为工具和观察器共享同一份会话状态。
     this.toolDefinition = Object.freeze({
@@ -72,6 +83,7 @@ export class TodoTracker {
     this.#nonTodoToolRounds += 1;
   }
 
+  // 达到陈旧阈值时仅为下一次请求生成临时系统消息，不污染可回放的历史。
   beforeModel(): readonly ChatMessage[] {
     if (this.#nonTodoToolRounds < STALE_TOOL_ROUNDS) {
       return [];
@@ -81,6 +93,7 @@ export class TodoTracker {
     return Object.freeze([systemMessage(TODO_STALE_REMINDER)]);
   }
 
+  // 成功后原子替换全部计划并重置计数；不会接受部分更新或保留过期项。
   #writeTodos(input: TodoWriteInput): ToolResult {
     // 先由 Zod 完整校验，再一次替换快照；失败路径不会触碰旧状态。
     this.#todos = Object.freeze(
@@ -91,6 +104,7 @@ export class TodoTracker {
   }
 }
 
+// 将快照序列化为 ASCII JSON，保证工具结果可安全嵌入模型上下文而不依赖终端编码。
 function serializeSnapshot(todos: readonly TodoItem[]): string {
   // 使用确定性 JSON 作为模型可见状态，方便下一轮完整替换。
   const json = JSON.stringify({
@@ -98,6 +112,7 @@ function serializeSnapshot(todos: readonly TodoItem[]): string {
   });
   const ascii: string[] = [];
 
+  // 非 BMP 字符拆成 UTF-16 代理对，保持 JSON 的 Unicode 转义合法。
   for (const character of json) {
     const codePoint = character.codePointAt(0);
     if (codePoint === undefined) {

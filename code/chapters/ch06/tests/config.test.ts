@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, test } from "vitest";
@@ -8,18 +9,16 @@ import { runCli } from "../src/cli.js";
 
 describe("OpenAI settings", () => {
   test("the unified CLI exits with code 2 before network access when config is missing", async () => {
-    // 真实 .env 与离线断言互斥：临时移走本机配置，断言后原样恢复。
-    const envPath = join(process.cwd(), ".env");
-    const originalEnv = existsSync(envPath) ? readFileSync(envPath, "utf8") : undefined;
-    if (originalEnv !== undefined) {
-      rmSync(envPath);
-    }
+    // CLI 从 process.cwd() 解析 .env，因此切到一个没有 .env 的临时目录即可断言缺失配置；
+    // 不能删除仓库根的真实 .env：20 章共用同一个文件，并发用例会互相摘掉对方的凭据。
+    const originalCwd = process.cwd();
+    const isolated = mkdtempSync(join(tmpdir(), "agent-tutorial-config-"));
+    process.chdir(isolated);
     try {
       await expect(runCli(["run", "--chapter", "1", "--prompt", "test"])).resolves.toBe(2);
     } finally {
-      if (originalEnv !== undefined) {
-        writeFileSync(envPath, originalEnv, "utf8");
-      }
+      process.chdir(originalCwd);
+      rmSync(isolated, { recursive: true, force: true });
     }
   });
 

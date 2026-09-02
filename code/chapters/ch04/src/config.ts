@@ -7,6 +7,7 @@ import { parse } from "dotenv";
 const requiredFields = ["OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"] as const;
 
 export class ConfigurationError extends Error {
+  // 配置错误携带全部缺失字段，CLI 进程边界据此返回退出码 2。
   override readonly name = "ConfigurationError";
   readonly missingFields: readonly string[];
 
@@ -37,6 +38,7 @@ export function settingsFromMapping(
     throw new ConfigurationError(missing);
   }
 
+  // 字段已非空，但 baseUrl 还需要协议与路径校验，避免 SDK 拼出错误请求地址。
   const baseUrl = mapping.OPENAI_BASE_URL;
   const apiKey = mapping.OPENAI_API_KEY;
   const model = mapping.OPENAI_MODEL;
@@ -70,5 +72,6 @@ export function settingsFromMapping(
 }
 
 export function settingsFromEnvFile(path: string, requireFallback = false): OpenAISettings {
+  // .env 解析同样走 mapping 校验，离线测试可注入假文件或直接注入 mapping。
   return settingsFromMapping(parse(readFileSync(path)), requireFallback);
 }

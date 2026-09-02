@@ -31,37 +31,54 @@ const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const PROCESS_LOCK_TAILS = new Map<string, Promise<void>>();
 
 export interface JsonCronStoreOptions {
+  // 计划与事件 id 可分别注入，测试可以稳定覆盖碰撞和幂等场景。
   readonly idGenerator?: () => string;
   readonly eventIdGenerator?: () => string;
+  // durable 与 session outbox 共享的总容量。
   readonly outboxCapacity?: number;
+  // 原子替换注入点用于模拟写盘失败。
   readonly atomicReplace?: (path: string, content: Buffer) => Promise<void>;
 }
 interface CronPaths {
+  // realpath 后的工作区根目录。
   readonly workspace: string;
+  // .agent_tutorial 运行时状态根。
   readonly stateRoot: string;
+  // Cron 状态目录。
   readonly root: string;
+  // durable job 与 outbox 的单文件快照。
   readonly state: string;
+  // 快照读改写使用的跨进程锁路径。
   readonly lock: string;
+  // durable scheduler leader lease 使用的独立目录。
   readonly leader: string;
 }
 // state.json 只保存 durable job/outbox；session-only 状态始终留在内存中。
 interface CronState {
+  // 快照 schema 版本。
   readonly version: number;
+  // 仅包含 durable 计划。
   readonly jobs: readonly CronJob[];
+  // 仅包含 durable 待确认事件。
   readonly outbox: readonly CronEvent[];
 }
 
+// JSON store 统一管理 durable 磁盘快照与当前进程 session-only 状态。
 export class JsonCronStore implements CronStore {
+  // 外部 workspace 输入；每次 I/O 前重新解析真实路径。
   readonly #workspaceInput: string;
   readonly #idGenerator: () => string;
   readonly #eventIdGenerator: () => string;
+  // 单次 tick 最多保留的未确认事件总量。
   readonly #outboxCapacity: number;
   readonly #atomicReplace: (path: string, content: Buffer) => Promise<void>;
   // durable=False 的 job 与 pending event 只保存在本实例，不写入 state.json。
   readonly #sessionJobs = new Map<string, CronJob>();
   readonly #sessionOutbox = new Map<string, CronEvent>();
+  // 当前实例持有的 leader 释放函数；undefined 表示非 leader。
   #leaderRelease: (() => Promise<void>) | undefined;
 
+  // 校验注入边界和容量；构造器不创建状态目录。
   constructor(workspace: string, options: JsonCronStoreOptions = {}) {
     if (typeof workspace !== "string" || workspace.trim().length === 0)
       throw new TypeError("workspace must be a non-empty string");
@@ -75,6 +92,7 @@ export class JsonCronStore implements CronStore {
     this.#atomicReplace = options.atomicReplace ?? atomicReplace;
   }
 
+  // 验证并创建计划；durable 原子写入快照，session-only 只进入内存 Map。
   async scheduleCron(input: {
     cron: string;
     prompt: string;
@@ -114,6 +132,7 @@ export class JsonCronStore implements CronStore {
     });
   }
 
+  // 合并磁盘与内存状态读取单个计划。
   async getJob(jobId: string): Promise<CronJob> {
     // 查询时把 durable 快照与 session-only 合并，调用方不需要知道 job 来自哪个生命周期。
     const id = this.#lookupJobId(jobId);
@@ -127,6 +146,7 @@ export class JsonCronStore implements CronStore {
       return job;
     });
   }
+  // 返回 durable 与 session-only 合并后的有序不可变快照。
   async listJobs(): Promise<readonly CronJob[]> {
     const paths = await this.#preparePaths(false);
     return await this.#withLock(paths, async () =>
@@ -138,6 +158,7 @@ export class JsonCronStore implements CronStore {
     );
   }
 
+  // 在同一临界区生成到期事件、推进 recurring 槽位并删除 one-shot 计划。
   async tick(nowUtc: Date, includeDurable = true): Promise<readonly CronEvent[]> {
     if (typeof includeDurable !== "boolean")
       throw new TypeError("includeDurable must be a boolean");
@@ -216,6 +237,7 @@ export class JsonCronStore implements CronStore {
     });
   }
 
+  // 返回按槽位和事件 id 排序的未确认 outbox 快照。
   async pendingEvents(includeDurable = true): Promise<readonly CronEvent[]> {
     if (typeof includeDurable !== "boolean")
       throw new TypeError("includeDurable must be a boolean");
@@ -233,6 +255,7 @@ export class JsonCronStore implements CronStore {
       ),
     );
   }
+  // 从对应生命周期的 outbox 删除事件；不存在时返回 false 供 runtime 检测丢失确认。
   async ackEvent(eventId: string): Promise<boolean> {
     const id = this.#lookupEventId(eventId);
     const paths = await this.#preparePaths(false);
@@ -248,6 +271,7 @@ export class JsonCronStore implements CronStore {
       return true;
     });
   }
+  // 非阻塞争夺 durable scheduler leader lease；同实例重复争夺也返回 false。
   async tryAcquireLeader(): Promise<boolean> {
     if (this.#leaderRelease !== undefined) return false;
     const paths = await this.#preparePaths(true);
@@ -267,6 +291,7 @@ export class JsonCronStore implements CronStore {
     this.#leaderRelease = release;
     return true;
   }
+  // 幂等释放 leader lease，并把底层释放失败包装为存储错误。
   async releaseLeader(): Promise<void> {
     if (this.#leaderRelease === undefined) return;
     const release = this.#leaderRelease;
@@ -278,6 +303,7 @@ export class JsonCronStore implements CronStore {
     }
   }
 
+  // 构造并验证所有状态路径；create=false 时允许目录尚不存在。
   async #preparePaths(create: boolean): Promise<CronPaths> {
     // 状态路径固定在 workspace/.agent_tutorial 下，并在创建或读取前验证不能逃逸 workspace。
     try {
@@ -315,6 +341,7 @@ export class JsonCronStore implements CronStore {
       throw new CronStorageError("Cron state root is invalid", { cause: error });
     }
   }
+  // 用进程内队列与跨进程目录锁包住一次完整快照操作。
   async #withLock<T>(paths: CronPaths, operation: () => Promise<T>): Promise<T> {
     // 进程内 mutex 加 proper-lockfile 目录锁双重串行化，保证同一时刻只有一次快照读改写。
     return await withMutex(paths.workspace, async () => {
@@ -358,6 +385,7 @@ export class JsonCronStore implements CronStore {
       }
     });
   }
+  // 严格读取 durable 快照；缺失文件等价于空的当前版本状态。
   async #loadState(paths: CronPaths): Promise<CronState> {
     if (!(await exists(paths.state))) return { version: STATE_VERSION, jobs: [], outbox: [] };
     try {
@@ -373,6 +401,7 @@ export class JsonCronStore implements CronStore {
       throw new CronStorageError("Cron state is invalid", { cause: error });
     }
   }
+  // 将完整 durable 状态序列化后原子替换，避免部分写入。
   async #persist(paths: CronPaths, state: CronState): Promise<void> {
     try {
       // 写入始终走原子替换，提交的新快照与旧字节只能二选一。
@@ -395,6 +424,7 @@ export class JsonCronStore implements CronStore {
       });
     }
   }
+  // 查询 ID 格式错误统一表现为 job not found，避免泄漏存储实现细节。
   #lookupJobId(value: string): string {
     try {
       return canonicalCronId(value);
@@ -402,6 +432,7 @@ export class JsonCronStore implements CronStore {
       throw new CronJobNotFoundError("Cron job id must be a canonical UUID");
     }
   }
+  // ack 使用的事件 ID 必须是规范 UUID，格式错误属于存储契约失败。
   #lookupEventId(value: string): string {
     try {
       return canonicalCronId(value);
@@ -441,6 +472,7 @@ function parseState(value: unknown): CronState {
     throw new CronStorageError("Cron state contains invalid duplicate or non-durable records");
   return { version: STATE_VERSION, jobs, outbox };
 }
+// 从 durable 快照恢复单个计划，并重新验证表达式、时区和槽位单调性。
 function parseJob(value: unknown): CronJob {
   if (typeof value !== "object" || value === null || Array.isArray(value))
     throw new CronStorageError("Cron job is invalid");
@@ -496,6 +528,7 @@ function parseJob(value: unknown): CronJob {
     lastSlotAtUtc: last,
   });
 }
+// 从 durable outbox 恢复事件，并重建 RuntimeEvent 的方法和上下文字段。
 function parseEvent(value: unknown): CronEvent {
   if (typeof value !== "object" || value === null || Array.isArray(value))
     throw new CronStorageError("Cron event is invalid");
@@ -541,9 +574,11 @@ function requireExactKeys(
     throw new CronStorageError(`${label} contains unsupported fields`);
   }
 }
+// 持久化时间必须显式带 Z，拒绝依赖环境时区解释的字符串。
 function isUtcTimestamp(value: string): boolean {
   return /Z$/u.test(value);
 }
+// 以稳定字段名和 UTC ISO 字符串生成可审计的 state.json payload。
 function serializeState(state: CronState): Record<string, unknown> {
   return {
     version: STATE_VERSION,
@@ -569,11 +604,13 @@ function serializeState(state: CronState): Record<string, unknown> {
     })),
   };
 }
+// 统一校验并裁剪计划中的必填文本字段。
 function requireText(value: string, label: string): string {
   if (typeof value !== "string" || value.trim().length === 0)
     throw new CronStorageError(`${label} must not be empty`);
   return value.trim();
 }
+// 安全读取 Node/proper-lockfile 错误码。
 function hasCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && Reflect.get(error, "code") === code;
 }

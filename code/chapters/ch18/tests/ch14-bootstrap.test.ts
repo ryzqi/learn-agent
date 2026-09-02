@@ -78,6 +78,8 @@ describe("chapter 14 bootstrap", () => {
         "list_tasks",
         "claim_task",
         "complete_task",
+        "query_background_job",
+        "cancel_background_job",
         "schedule_cron",
       ]);
       await runner.close();

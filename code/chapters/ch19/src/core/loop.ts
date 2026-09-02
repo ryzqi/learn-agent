@@ -490,6 +490,8 @@ export class AgentRunner {
     results: readonly ToolResult[],
     calls: readonly ToolCall[],
   ): Promise<readonly ToolResult[]> {
+    // 处理器只能改变结果内容，不能改变调用数量；失败时为每个 call 生成配对错误，
+    // 以保持模型协议的 tool_call/tool_result 一一对应关系。
     // 未配置处理器时仍复制结果，避免调用方通过同一对象意外修改历史。
     if (this.#toolResultProcessor === undefined) {
       return Object.freeze(results.map((result) => copyToolResult(result)));
@@ -617,6 +619,8 @@ export class AgentRunner {
   }
 
   async #resolveToolContext(context: ToolContext): Promise<ToolContext> {
+    // 这是工具执行前的最后一道上下文边界：provider 可解析 claim，Loop 负责验证
+    // 不可变身份与真实路径，避免任意 provider 把工具带出受控 workspace。
     const provider = this.#toolContextProvider;
     if (provider === undefined) return context;
     // provider 负责把 claim 映射到受限 workspace；核心只验证身份不可变和路径仍在仓库根内。
@@ -640,6 +644,8 @@ export class AgentRunner {
   }
 
   async #complete(finalText: string, turns: number): Promise<RunResult> {
+    // 仅在 canonical history 通过配对校验且回合生命周期完成后构造结果，
+    // 返回值和历史都冻结，调用方不能事后篡改本次运行证据。
     validateToolPairing(this.#history);
     // complete 使用完整 canonical history，让 extractor 看到请求级压缩前的原始会话。
     if (this.#turnLifecycle !== undefined) {
@@ -686,6 +692,8 @@ export class AgentRunner {
     waitForPendingWork: boolean,
     allowContextEvents: boolean,
   ): Promise<RuntimeEvent | undefined> {
+    // 按当前回合类型筛选事件：用户回合延迟上下文事件，事件回合才消费它们；
+    // 每次只取一个事件，借助 eventId 与 pending ack 集合实现可重试且不重复注入。
     // 事件消费先做去重：普通新事件先写入历史并 ack，重复事件跳过；ack 失败时按事件类型回滚或保留重试状态。
     if (this.#eventPump === undefined) {
       return undefined;

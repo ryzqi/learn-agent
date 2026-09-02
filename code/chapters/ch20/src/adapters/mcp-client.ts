@@ -1,3 +1,4 @@
+// MCP stdio 客户端适配器：封装 SDK 初始化、分页发现、串行调用、超时映射与子进程终态传播。
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
@@ -12,11 +13,13 @@ import {
 import type { McpConnection, McpConnectionFactory, McpServerSpec } from "../features/mcp-tools.js";
 
 const CLIENT_INFO = Object.freeze({ name: "agent-tutorial", version: "0.1.0" });
+// 请求超时后短暂观察子进程状态，用于区分纯超时与 transport 已退出。
 const TRANSPORT_EXIT_GRACE_MS = 100;
 
 // stdio 工厂仅在连接成功后交付实例；初始化失败时先关闭子进程相关资源。
 export class StdioMcpConnectionFactory implements McpConnectionFactory {
   async open(spec: McpServerSpec, signal?: AbortSignal): Promise<McpConnection> {
+    // start 成功是工厂交付边界；失败时先尽力关闭 client/transport，避免遗留子进程。
     const connection = new StdioMcpConnection(spec);
     try {
       await connection.start(signal);
@@ -30,11 +33,15 @@ export class StdioMcpConnectionFactory implements McpConnectionFactory {
 
 // 单连接将请求串行化，并将传输终止传播给排队和进行中的 MCP 调用。
 class StdioMcpConnection implements McpConnection {
+  // spec 决定启动命令与超时；transport/client 生命周期与本连接实例一一对应。
   readonly #spec: McpServerSpec;
   readonly #transport: StdioClientTransport;
   readonly #client: Client;
+  // 串行队列尾链：同一 connection 的新操作总是排在已有操作之后。
   #tail: Promise<void> = Promise.resolve();
+  // 首个不可逆 transport 错误只记录一次，终止所有当前等待者并让后续操作直接失败。
   #terminalError: McpTransportError | undefined;
+  // terminalFailure 参与正在执行请求的 Promise.race；terminalSignal 只通知 Watchdog。
   #rejectTerminal: (error: McpTransportError) => void = () => {};
   #resolveTerminal: () => void = () => {};
   readonly #terminalFailure = new Promise<never>((_, reject) => {
@@ -44,10 +51,12 @@ class StdioMcpConnection implements McpConnection {
     this.#resolveTerminal = resolve;
   });
   #closing = false;
+  // closed 是最终资源状态，started 防止同一 SDK client 重复 initialize。
   #closed = false;
   #started = false;
 
   constructor(spec: McpServerSpec) {
+    // 构造阶段只创建 transport/client 并绑定终态回调，不启动子进程协议握手。
     this.#spec = spec;
     this.#transport = new StdioClientTransport({
       command: spec.command,
@@ -216,6 +225,7 @@ class StdioMcpConnection implements McpConnection {
         throw mapSdkError(error, "MCP stdio request failed");
       }
     });
+    // 无论 queued 成败，tail 都结算为 undefined，保证下个操作从当前批次结束后开始排队。
     this.#tail = queued.then(
       () => undefined,
       () => undefined,
@@ -263,6 +273,7 @@ function requestOptions(
   readonly maxTotalTimeout: number;
   readonly signal?: AbortSignal;
 } {
+  // SDK 的单次和累计超时使用同一预算，避免内部重试突破本地策略上限。
   const timeout = milliseconds(seconds);
   return Object.freeze({
     timeout,
@@ -299,6 +310,7 @@ function isRequestTimeout(error: unknown): error is McpError {
 
 // 给异步结果附加调用方 abort 监听，取消时只拒绝当前等待者。
 function waitForAbort<Result>(promise: Promise<Result>, signal?: AbortSignal): Promise<Result> {
+  // AbortSignal 只取消当前调用方等待；底层串行队列仍负责结算实际 SDK 操作。
   if (signal === undefined) return promise;
   if (signal.aborted) return Promise.reject(abortReason(signal));
   return new Promise<Result>((resolve, reject) => {

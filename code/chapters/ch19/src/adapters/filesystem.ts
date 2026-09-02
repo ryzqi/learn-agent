@@ -1,3 +1,4 @@
+// Node 文件系统适配器：把 core 的 WorkspaceFileSystem 契约落到本机路径；所有路径先做词法与 realpath 边界校验，再执行读、写、编辑和 glob。
 import {
   lstat,
   mkdir,
@@ -104,6 +105,7 @@ function relativeParts(value: string, label: string, allowWildcards: boolean): s
   return parts;
 }
 
+// 先用 realpath 固定物理 workspace，后续所有路径判断都以这个真实目录为根。
 async function workspaceRoot(workspace: string): Promise<string> {
   const root = await realpath(workspace);
   const information = await stat(root);
@@ -113,6 +115,7 @@ async function workspaceRoot(workspace: string): Promise<string> {
   return root;
 }
 
+// 向上找到最近存在的父目录并解析物理位置，让尚未创建的写入目标也经过链接逃逸检查。
 async function resolvedExistingParent(
   root: string,
   target: string,
@@ -205,6 +208,7 @@ function globRegex(pattern: string): RegExp {
   return new RegExp(`${source}$`, "u");
 }
 
+// 先只解析通配符之前的字面前缀，缩小编历范围且仍然走 safePath 的安全边界。
 async function literalPrefix(root: string, parts: readonly string[]): Promise<readonly string[]> {
   const literal: string[] = [];
   for (const part of parts) {
@@ -232,6 +236,7 @@ export class NodeWorkspaceFileSystem implements WorkspaceFileSystem {
     }
   }
 
+  // 读取时同步处理 UTF-8 解码和可选的截断行数，避免超大文件直接进入上下文。
   async readFile(workspace: string, relativePath: string, limit?: number): Promise<string> {
     try {
       if (limit !== undefined && (!Number.isInteger(limit) || limit <= 0)) {
@@ -249,6 +254,7 @@ export class NodeWorkspaceFileSystem implements WorkspaceFileSystem {
     }
   }
 
+  // 写入先校验安全路径，再递归创建父目录；返回的是 UTF-8 编码后的实际字节数。
   async writeFile(workspace: string, relativePath: string, content: string): Promise<number> {
     try {
       const target = await safePath(workspace, relativePath);
@@ -261,6 +267,7 @@ export class NodeWorkspaceFileSystem implements WorkspaceFileSystem {
     }
   }
 
+  // 编辑要求精确匹配 old_text，避免用模糊替换改变未预期的相邻内容。
   async editFile(
     workspace: string,
     relativePath: string,
@@ -285,6 +292,7 @@ export class NodeWorkspaceFileSystem implements WorkspaceFileSystem {
     }
   }
 
+  // glob 从通配符之前的字面前缀开始遍历，不跟随符号链接目录，匹配结果再次过安全边界。
   async globFiles(workspace: string, pattern: string): Promise<readonly string[]> {
     try {
       const root = await workspaceRoot(workspace);

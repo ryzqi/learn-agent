@@ -106,6 +106,7 @@ export class ToolRegistry {
   readonly #definitions: Map<string, StoredToolDefinition>;
   readonly #sourceDefinitions: WeakMap<object, StoredToolDefinition>;
   readonly #mutable: boolean;
+  // 版本号只在成功整体变更后递增；snapshot 与 live registry 版本一致，但不共享 Map。
   #version: number;
 
   constructor(

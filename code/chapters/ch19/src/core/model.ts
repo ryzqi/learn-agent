@@ -1,9 +1,12 @@
+// 模型适配契约：供应商响应统一归一为 ModelReply，并把限流、过载、超长等错误映射成可恢复的 ModelAPIError 子类型。
 import type { AssistantMessage, ChatMessage } from "./messages.js";
 
 // 供应商 adapter 必须归一为这些结束状态，循环据此处理不可完成或被过滤的回复。
+// content_filter 在这里是合法 wire 值，但能否进入最终结果由 loop 层决定。
 export type FinishReason = "stop" | "length" | "tool_calls" | "content_filter" | "function_call";
 
 // typed API error 只携带适配器稳定提取的状态、错误码和请求 ID，供恢复层按类型分派。
+// 基类字段全部在构造时校验，statusCode 必须是正整数；错误对象本身也必须满足可靠契约。
 export class ModelAPIError extends Error {
   readonly statusCode: number;
   readonly errorCode: string | undefined;
@@ -112,6 +115,8 @@ export class ModelPromptTooLongError extends ModelAPIError {
 }
 
 export interface OpenAIToolSchema {
+  // 工具 schema 只接受 OpenAI 兼容 function 结构；parameters 保留原始 JSON Schema，
+  // 由请求映射层原样透传，不在 core 中解析具体参数类型。
   readonly type: "function";
   readonly function: {
     readonly name: string;
@@ -121,6 +126,8 @@ export interface OpenAIToolSchema {
 }
 
 // model 和 maxTokens 可由恢复层覆写；messages/tools 是每次请求的完整快照。
+// 一次完整模型请求的快照。messages/tools 是完整上下文；model/maxTokens 可选，
+// 以便 RecoveryManager 在不改动消息内容的前提下切换模型或提升输出预算。
 export interface ModelRequest {
   readonly messages: readonly ChatMessage[];
   readonly tools: readonly OpenAIToolSchema[];
@@ -129,12 +136,15 @@ export interface ModelRequest {
 }
 
 export interface TokenUsage {
+  // usage 只接受三个非负整数；adapter 必须完成校验后才填充，避免恢复层或日志拿到残缺计数。
   readonly promptTokens: number;
   readonly completionTokens: number;
   readonly totalTokens: number;
 }
 
 // reply 必须是一次完整模型输出；finishReason 为 length 时由上层决定是否续写。
+// reply 必须是一次完整模型输出；finishReason 为 length 时由上层决定是否续写，
+// content_filter 表示内容被过滤，不能当作正常最终回复。
 export interface ModelReply {
   readonly message: AssistantMessage;
   readonly finishReason: FinishReason;
@@ -142,6 +152,7 @@ export interface ModelReply {
 }
 
 // core 只依赖一次完整调用，不感知 OpenAI SDK 或 HTTP 细节；signal 传播取消与超时。
+// 调用方负责总时限和重试策略，ModelClient 本身不自动重试。
 export interface ModelClient {
   complete(request: ModelRequest, signal?: AbortSignal): Promise<ModelReply>;
 }

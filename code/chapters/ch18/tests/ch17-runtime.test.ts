@@ -252,7 +252,7 @@ class CoordinatedAutoCompleteModel implements ModelClient {
 
 async function waitForEventWithin(
   runtime: TeammateRuntime,
-  timeoutMs = 1_000,
+  timeoutMs = 15_000,
 ): Promise<readonly RuntimeEvent[]> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {

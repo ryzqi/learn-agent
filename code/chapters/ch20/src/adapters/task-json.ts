@@ -59,6 +59,7 @@ export class JsonTaskStore implements TaskStore {
   readonly #atomicReplace: (path: string, content: Buffer) => Promise<void>;
 
   constructor(workspace: string, options: JsonTaskStoreOptions = {}) {
+    // 构造器只校验外部边界；idGenerator/atomicReplace 是测试可注入的确定性和故障点。
     if (typeof workspace !== "string" || workspace.trim().length === 0) {
       throw new TypeError("workspace must be a non-empty string");
     }
@@ -74,11 +75,13 @@ export class JsonTaskStore implements TaskStore {
   }
 
   async createTask(input: CreateTaskInput): Promise<Task> {
+    // createTask 在锁内重载图、校验无环和唯一 ID，然后原子写入任务。
     const paths = await this.#preparePaths(true);
     if (paths === undefined) {
       throw new TaskStorageError("Task storage root could not be created");
     }
     return await this.#withLock(paths, async () => {
+      // 锁内重建整张图，按“无碰撞 -> 依赖存在 -> 无自依赖 -> 全图无环”的顺序决定是否写入。
       const graph = await this.#loadGraph(paths);
       const id = this.#generatedId();
       if (graph.has(id)) {
@@ -107,6 +110,7 @@ export class JsonTaskStore implements TaskStore {
       throw new TaskNotFoundError(`Task not found: ${id}`);
     }
     return await this.#withLock(paths, async () => {
+      // 锁内重读全图后重新计算阻塞：即使锁外任务刚变 ready，临界区内也只能看到最新图。
       const task = (await this.#loadGraph(paths)).get(id);
       if (task === undefined) {
         throw new TaskNotFoundError(`Task not found: ${id}`);
@@ -394,6 +398,7 @@ export class JsonTaskStore implements TaskStore {
 }
 
 function parseStoredTask(value: unknown): Task {
+  // 磁盘 schema 必须精确匹配六个字段；额外或缺失字段都会让整张图恢复失败。
   if (!hasExactKeys(value, ["id", "subject", "description", "status", "owner", "blocked_by"])) {
     throw new TaskStorageError("Task file has an invalid schema");
   }
@@ -429,6 +434,7 @@ function parseStoredTask(value: unknown): Task {
 }
 
 function serializeTask(task: Task): Buffer {
+  // 固定字段顺序和结尾换行，让任务文件可 diff、可审计，也避免写盘内容随机漂移。
   const payload = {
     blocked_by: [...task.blockedBy],
     description: task.description,

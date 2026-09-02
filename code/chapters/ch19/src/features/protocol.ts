@@ -79,45 +79,71 @@ export class ProtocolDeliveryError extends ProtocolError {
 
 // resolution 记录“哪个 message 在何时完成审批”，也是同 message 重试幂等判定的证据。
 export interface ProtocolResolution {
+  // 唯一完成本次请求的响应消息；重试必须携带同一 id 才能幂等返回。
   readonly messageId: string;
+  // 结构化审批结论，禁止从自然语言正文推断通过或拒绝。
   readonly approved: boolean;
+  // 保留审批反馈或关闭确认文本，供后续提示和审计读取。
   readonly content: string;
+  // 状态真正迁移到终态的时刻，而不是响应最初创建的时刻。
   readonly resolvedAtUtc: Date;
 }
 export interface ProtocolRequest {
   // 协议请求持久化审批状态与唯一 resolution，重启后仍可恢复一致的协作结论。
+  // 请求 UUID 同时写入请求与响应 Mailbox 消息，作为二者的关联键。
   readonly id: string;
+  // 决定合法消息方向、响应类型以及消费后的业务语义。
   readonly kind: ProtocolRequestKind;
+  // 发起请求的一方；shutdown 为 Lead，plan_approval 为队友。
   readonly sender: string;
+  // 请求接收方；响应只能沿相反方向返回。
   readonly target: string;
+  // pending 才能被消费，approved/rejected 都是不可逆终态。
   readonly status: ProtocolRequestStatus;
+  // 请求正文必须与请求消息逐字一致，防止持久状态与传输内容漂移。
   readonly content: string;
+  // 创建顺序用于判定某队友的“最新计划”，存储层禁止时钟倒退。
   readonly createdAtUtc: Date;
+  // 到期后即使消息仍在 Mailbox，也不得再推进协议状态。
   readonly expiresAtUtc: Date;
+  // pending 必须为 null，终态必须携带唯一 resolution。
   readonly resolution: ProtocolResolution | null;
 }
 
 // store 是协议请求的状态真相；Runtime 负责先登记请求，再把 typed message 投递到 Mailbox。
 export interface ProtocolStore {
+  // 先持久化 pending 请求；调用方随后才能投递对应 Mailbox 消息。
   createRequest(input: {
     readonly kind: ProtocolRequestKind;
     readonly sender: string;
     readonly target: string;
     readonly content: string;
   }): Promise<ProtocolRequest>;
+  // 返回任意状态请求，供诊断和最终结论读取。
   getRequest(id: string): Promise<ProtocolRequest>;
+  // 按创建顺序返回完整快照，不向调用方暴露可变内部数组。
   listRequests(): Promise<readonly ProtocolRequest[]>;
+  // 只允许取得尚未解决且未过期的请求，用于 Lead 审批入口。
   getPendingRequest(id: string): Promise<ProtocolRequest>;
+  // 计划门禁只依据指定队友最后一次提交的计划状态。
   latestPlanRequest(sender: string): Promise<ProtocolRequest | undefined>;
+  // 只读验证请求消息与持久请求完全配对，不迁移状态。
   validateRequest(message: ProtocolMailboxMessage): Promise<ProtocolRequest>;
+  // 只读验证响应，供事件进入历史前提前隔离无效消息。
   validateResponse(message: ProtocolMailboxMessage): Promise<ProtocolRequest>;
+  // 原子写入 resolution；同一响应可重试，另一响应不得覆盖终态。
   consumeResponse(message: ProtocolMailboxMessage): Promise<ProtocolRequest>;
 }
 
+// TeamHost 是协议运行时需要的最小协作宿主，避免依赖完整 TeammateRuntime 实现。
 export interface ProtocolTeamHost {
+  // 协议构造时校验底层 Store 具备 typed protocol message 能力。
   readonly mailboxStore: MailboxStore;
+  // 用于拒绝向 failed/shutdown 队友创建新请求。
   state(name: string): { readonly status: TeammateStatus };
+  // 收到 shutdown request 后先封闭队友入口，再发送确认响应。
   beginShutdown(name: string): void;
+  // 唯一传输出口，复用参与者校验、注册表串行化与 Lead 唤醒逻辑。
   deliverProtocol(
     sender: string,
     recipient: string,
@@ -166,24 +192,30 @@ export class ProtocolRuntime {
     });
   }
   get teamRuntime(): ProtocolTeamHost {
+    // 组合根以对象身份确认协议层与队友层共享同一宿主。
     return this.#team;
   }
   get store(): ProtocolStore {
+    // 暴露只读协议状态边界，避免组合层另建平行状态源。
     return this.#store;
   }
   get mailboxStore(): MailboxStore {
+    // 协议和普通队友消息必须落入同一个 MailboxStore。
     return this.#team.mailboxStore;
   }
   get planGateRule(): PermissionRule {
+    // 队友 Runner 构建权限策略时追加该 deny 规则。
     return this.#planGateRule;
   }
   get leadToolDefinitions(): readonly [
     ToolDefinition<z.infer<typeof shutdownInput>>,
     ToolDefinition<z.infer<typeof reviewPlanInput>>,
   ] {
+    // Lead 只获得发起关闭和审批计划两个协议工具。
     return Object.freeze([this.#requestShutdownTool(), this.#reviewPlanTool()]);
   }
   get submitPlanToolDefinition(): ToolDefinition<z.infer<typeof submitPlanInput>> {
+    // 队友只获得提交计划工具，不能自行审批或关闭其他队友。
     return this.#submitPlanTool();
   }
 
@@ -216,6 +248,7 @@ export class ProtocolRuntime {
     approve: boolean,
     feedback = "",
   ): Promise<ProtocolMailboxMessage> {
+    // 非规范 UUID 统一按“请求不存在”处理，避免把内部 ID 格式差异暴露给模型。
     let normalizedRequestId: string;
     try {
       normalizedRequestId = canonicalMailboxMessageId(requestId);
@@ -359,7 +392,9 @@ export class ProtocolRuntime {
     return !(await this.planAllowsEffectful(request.context.identity));
   }
   #requestShutdownTool(): ToolDefinition<z.infer<typeof shutdownInput>> {
+    // 定义最终由 ToolRegistry 固化，handler 只编排协议，不直接释放资源。
     return {
+      // 关机工具只负责登记并投递协议请求；真正收束 Runner 的资源由组合根 close() 完成。
       name: "request_shutdown",
       description: "Request a teammate to finish current work and shut down gracefully.",
       inputSchema: shutdownInput,
@@ -374,7 +409,9 @@ export class ProtocolRuntime {
     };
   }
   #reviewPlanTool(): ToolDefinition<z.infer<typeof reviewPlanInput>> {
+    // request_id 是审批对象的唯一选择器，approve 是唯一决策来源。
     return {
+      // 审批工具必须基于 request_id 定位 pending 请求，不能用模型自由文本猜测目标。
       name: "review_plan",
       description: "Approve or reject a pending teammate plan request.",
       inputSchema: reviewPlanInput,
@@ -391,7 +428,9 @@ export class ProtocolRuntime {
     };
   }
   #submitPlanTool(): ToolDefinition<z.infer<typeof submitPlanInput>> {
+    // plan gate 显式放行此 external 工具，避免“未审批不能申请审批”的死锁。
     return {
+      // 提交计划工具从 ToolContext.identity 取 sender，工具输入不允许伪造发送者。
       name: "submit_plan",
       description: "Submit a plan to the lead and wait for a structured approval response.",
       inputSchema: submitPlanInput,
@@ -413,10 +452,12 @@ function protocolToolError(error: unknown): ToolResult {
     : toolError("protocol_error", "Protocol operation failed");
 }
 function requireText(value: string, label: string): string {
+  // 协议正文统一裁剪并拒绝空白，使持久层和传输层共享稳定文本。
   if (typeof value !== "string" || value.trim().length === 0)
     throw new ProtocolStateError(`${label} must not be empty`);
   return value.trim();
 }
 function abortError(): DOMException {
+  // 标准 AbortError 让传输边界可区分取消与真实投递故障。
   return new DOMException("Protocol delivery was aborted", "AbortError");
 }

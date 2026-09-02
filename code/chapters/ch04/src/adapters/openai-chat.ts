@@ -19,6 +19,7 @@ import type {
 } from "../core/model.js";
 import type { OpenAISettings } from "../config.js";
 
+// 供应商响应违反内部模型契约时使用的边界错误。
 export class OpenAIResponseError extends Error {
   override readonly name = "OpenAIResponseError";
 }
@@ -45,11 +46,14 @@ export class OpenAIChatModel implements ModelClient {
             maxRetries: 0,
           })
         : client;
+    // 固定模型名；后续章节可通过 ModelRequest.model 临时替换。
     this.#model = settings.model;
   }
 
   async complete(request: ModelRequest): Promise<ModelReply> {
+    // 发请求前验证历史配对，避免把无效会话发送给供应商。
     validateToolPairing(request.messages);
+    // maxTokens 检查防止零或负值导致供应商 API 报错而非修复调用方错误。
     if (
       request.maxTokens !== undefined &&
       (!Number.isInteger(request.maxTokens) || request.maxTokens <= 0)
@@ -80,6 +84,7 @@ interface NormalizedResponse {
 }
 
 function normalizeResponse(response: unknown): NormalizedResponse {
+  // OpenAI SDK 边界返回 unknown；逐层缩窄后再进入受信任的 core 类型。
   if (typeof response !== "object" || response === null) {
     throw new OpenAIResponseError("Chat completion response must be an object");
   }
@@ -154,6 +159,7 @@ function normalizeToolCall(call: unknown): ReturnType<typeof toolCall> {
 }
 
 function isFinishReason(value: unknown): value is FinishReason {
+  // 显式列出所有已知 finish_reason，未知值按不可恢复错误拒绝。
   return (
     value === "stop" ||
     value === "length" ||
@@ -164,6 +170,7 @@ function isFinishReason(value: unknown): value is FinishReason {
 }
 
 function toOpenAIMessage(message: ChatMessage): ChatCompletionMessageParam {
+  // 内部消息模型与 OpenAI 结构的转换集中在 adapter，core 不依赖 SDK 类型。
   switch (message.role) {
     case "system":
     case "user":
@@ -199,9 +206,11 @@ function toOpenAITool(tool: ModelRequest["tools"][number]): ChatCompletionTool {
 }
 
 function normalizeUsage(usage: unknown): TokenUsage {
+  // 用量字段用于观测，仍按严格整数契约拒绝不完整响应。
   if (typeof usage !== "object" || usage === null) {
     throw new OpenAIResponseError("Chat completion usage must be an object");
   }
+  // 字段类型和值范围都由 adapter 收敛，core 不做运行时负值检查。
   const promptTokens = readUsageCount(usage, "prompt_tokens");
   const completionTokens = readUsageCount(usage, "completion_tokens");
   const totalTokens = readUsageCount(usage, "total_tokens");

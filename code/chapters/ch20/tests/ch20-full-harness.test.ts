@@ -65,6 +65,8 @@ const LEAD_TOOLS = [
   "list_tasks",
   "claim_task",
   "complete_task",
+  "query_background_job",
+  "cancel_background_job",
   "create_worktree",
   "keep_worktree",
   "remove_worktree",
